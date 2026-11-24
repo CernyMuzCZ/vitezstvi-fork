@@ -34,6 +34,8 @@ mod spread;
 #[cfg(windows)]
 mod draw;
 pub mod dxgi;
+#[cfg(windows)]
+pub mod ffx;
 pub mod fence;
 pub mod frame;
 #[cfg(windows)]
