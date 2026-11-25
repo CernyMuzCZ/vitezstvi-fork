@@ -2110,6 +2110,12 @@ struct Deferred {
     /// ranges dozens of times).
     written: Vec<(usize, usize)>,
     written_once: std::collections::HashSet<(usize, usize)>,
+    /// `VICTORY_BVH_QUARANTINE`: the list records a stage of the structure
+    /// builder, so nothing its shaders write is copied back into title
+    /// memory. Copy-backs are declared per list, not per dispatch: another
+    /// shader's declaration in the same list covered the builder's stores
+    /// too, and quarantine leaked.
+    quarantined: bool,
 }
 
 impl Deferred {
@@ -6919,6 +6925,9 @@ impl HostList {
         if deferred.written_once.insert(range) {
             deferred.written.push(range);
         }
+        if deferred.quarantined {
+            return;
+        }
         deferred.copies.push(Step::GpuWrite(shadow.clone(), address, len));
     }
 
@@ -6944,6 +6953,17 @@ impl HostList {
     #[cfg(test)]
     pub(crate) fn deferred_early(&self) -> usize {
         self.deferred().early.len()
+    }
+
+    /// The list records a quarantined stage of the structure builder: no
+    /// shader write of the whole list is copied back into title memory,
+    /// those declared before it included (see `Deferred::quarantined`).
+    pub(crate) fn quarantine(&self) {
+        let mut deferred = self.deferred();
+        if !deferred.quarantined {
+            deferred.quarantined = true;
+            deferred.copies.retain(|step| !matches!(step, Step::GpuWrite(..)));
+        }
     }
 
     /// A read back: once the list has run, `rows` rows of `row` bytes go
