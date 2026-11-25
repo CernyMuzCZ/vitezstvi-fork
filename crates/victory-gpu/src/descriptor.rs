@@ -213,7 +213,10 @@ pub(crate) fn sync_heaps() {
     }
     let started = std::time::Instant::now();
     let (mut pages, mut looked, mut mirrored) = (0u64, 0u64, 0u64);
-    let mut page_bytes: Vec<u8> = Vec::new();
+    // One page of bytes for every page looked at, and one list of the
+    // slots to mirror for every page: neither is allocated per page.
+    let mut page_bytes = vec![0u8; crate::watch::PAGE];
+    let mut due: Vec<(u32, u64)> = Vec::new();
     let _one = SYNCING.lock().unwrap_or_else(|e| e.into_inner());
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     for &(start, end, at) in heaps.iter() {
@@ -236,8 +239,8 @@ pub(crate) fn sync_heaps() {
                 // The page's records are read through the kernel, into a
                 // copy: a page the title unmaps meanwhile fails the read
                 // where 2,048 reads in place would fault.
-                page_bytes.resize(to - from, 0);
-                if crate::host::read_into(from as *const u8, &mut page_bytes) {
+                let slice = &mut page_bytes[..to - from];
+                if crate::host::read_into(from as *const u8, slice) {
                     pages += 1;
                     // Skip pages rewritten with identical bytes, and bound
                     // the changed span on modified pages (#783).
@@ -245,12 +248,12 @@ pub(crate) fn sync_heaps() {
                         let mut seen = seen_pages().lock().unwrap_or_else(|e| e.into_inner());
                         let held = seen.remove(&from);
                         let moved = match &held {
-                            Some(old) if old.as_slice() == page_bytes.as_slice() => {
+                            Some(old) if old.as_slice() == slice => {
                                 seen.insert(from, held.unwrap_or_default());
                                 page += crate::watch::PAGE;
                                 continue;
                             }
-                            Some(old) => page_diff(old, &page_bytes),
+                            Some(old) => page_diff(old, slice),
                             None => None,
                         };
                         if seen.len() >= 4096 {
@@ -258,7 +261,7 @@ pub(crate) fn sync_heaps() {
                         }
                         let mut store = held.unwrap_or_default();
                         store.clear();
-                        store.extend_from_slice(&page_bytes);
+                        store.extend_from_slice(slice);
                         seen.insert(from, store);
                         moved
                     };
@@ -267,7 +270,7 @@ pub(crate) fn sync_heaps() {
                     // (`HostHeap::mirror_copied_page`); one by one below
                     // with `VICTORY_HEAP_SYNC_PAGE=0`.
                     let slots = if page_at_once() {
-                        let (seen, made) = host.mirror_copied_page(slots, (start, step), from, &page_bytes, moved);
+                        let (seen, made) = host.mirror_copied_page(slots, (start, step), from, slice, moved, &mut due);
                         looked += seen;
                         mirrored += made;
                         0..0
@@ -281,7 +284,7 @@ pub(crate) fn sync_heaps() {
                         let Some(at) = (handle as usize).checked_sub(from) else {
                             continue;
                         };
-                        let Some(record) = page_bytes.get(at..at + step as usize) else {
+                        let Some(record) = slice.get(at..at + step as usize) else {
                             continue;
                         };
                         looked += 1;
