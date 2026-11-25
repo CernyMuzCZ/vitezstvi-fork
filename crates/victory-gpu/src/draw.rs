@@ -2021,11 +2021,12 @@ impl State {
             // may fill the texture's memory itself only afterwards, with
             // no descriptor write and nothing from the runtime to tell of
             // it. The host copy then kept what the memory held at the
-            // first look for the rest of the run. The look reads 48 KiB;
+            // first look for the rest of the run. The look reads 48 KiB and
+            // the start of each mip of each slice (`texture::fingerprint`);
             // only a changed texture is uploaded again.
             // `VICTORY_HEAP_RECHECK=0`: uploaded once, as before.
-            if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
-                let now = crate::texture::fingerprint(at, len);
+            if let Some(((at, len, print, looks, uploaded), mips)) = host.texture_slot_checked(index) {
+                let now = crate::texture::fingerprint(at, len, mips.as_deref().unwrap_or_default());
                 if now == print {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
                     // Past the last of `RECHECK_FRAMES`: every
@@ -2037,6 +2038,7 @@ impl State {
                             write,
                             frame + wait,
                             (at, len),
+                            mips,
                             print,
                             looks.saturating_add(1),
                             uploaded,
@@ -2217,9 +2219,9 @@ impl State {
             HEAP_TEXTURES.fetch_add(1, Ordering::Relaxed);
             match memory {
                 // Whole and uploaded: looked at again (see above).
-                Some((at, len)) => {
-                    let print = crate::texture::fingerprint(at, len);
-                    host.texture_slot_recheck(index, write, frame + RECHECK_FRAMES[0], (at, len), print, 0, frame);
+                Some((at, len, mips)) => {
+                    let print = crate::texture::fingerprint(at, len, mips.as_deref().unwrap_or_default());
+                    host.texture_slot_recheck(index, write, frame + RECHECK_FRAMES[0], (at, len), mips, print, 0, frame);
                 }
                 None => host.texture_slot_done(index, write, again),
             }
