@@ -8856,8 +8856,77 @@ fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
 
 const BUFFERS: u32 = 2;
 
+fn present_sync_interval() -> u32 {
+    static INTERVAL: OnceLock<u32> = OnceLock::new();
+    *INTERVAL.get_or_init(|| {
+        let Some(value) = std::env::var_os("VICTORY_PRESENT_SYNC") else {
+            return 0;
+        };
+        let interval = match value.to_str().and_then(|v| v.parse::<u32>().ok()) {
+            Some(n @ 0..=4) => n,
+            _ => {
+                tracing::warn!(?value, "invalid VICTORY_PRESENT_SYNC; expected 0..=4, using 0");
+                0
+            }
+        };
+        tracing::info!("present: sync interval={interval} (was 0)");
+        interval
+    })
+}
+
+#[derive(Default)]
+struct PresentTimes {
+    path: std::ffi::OsString,
+    last: Option<std::time::Instant>,
+    intervals: Vec<u64>,
+}
+
+impl PresentTimes {
+    fn frame(&mut self) -> std::io::Result<()> {
+        let now = std::time::Instant::now();
+        if let Some(last) = self.last.replace(now) {
+            self.intervals.push(now.duration_since(last).as_micros() as u64);
+        }
+        if (self.intervals.len() + 1) % 300 != 0 {
+            return Ok(());
+        }
+        self.write()
+    }
+
+    fn write(&self) -> std::io::Result<()> {
+        use std::io::Write;
+        let mut sorted = self.intervals.clone();
+        sorted.sort_unstable();
+        // Nearest-rank cumulative percentiles; the first frame has no interval.
+        let percentile = |p: usize| {
+            sorted.get((sorted.len() * p).div_ceil(100).saturating_sub(1)).copied().unwrap_or(0)
+        };
+        let (p50, p95, p99, max) = (percentile(50), percentile(95), percentile(99), percentile(100));
+        let mut out = std::io::BufWriter::new(std::fs::File::create(&self.path)?);
+        writeln!(out, "frame,interval_us,p50_us,p95_us,p99_us,max_us,dropped_estimate")?;
+        writeln!(out, "1,,{p50},{p95},{p99},{max},0")?;
+        let (mut total, mut dropped) = (0u64, 0u64);
+        for (i, &us) in self.intervals.iter().enumerate() {
+            // Missing median-sized slots, rounded to nearest; not DXGI drop telemetry.
+            let missed = ((us as f64 / p50.max(1) as f64).round() as u64).saturating_sub(1);
+            total = total.saturating_add(us);
+            dropped = dropped.saturating_add(missed);
+            writeln!(out, "{},{us},{p50},{p95},{p99},{max},{missed}", i + 2)?;
+        }
+        // Summary: frame = total:N, interval_us = first-to-last Present span.
+        writeln!(
+            out,
+            "total:{},{total},{p50},{p95},{p99},{max},{dropped}",
+            self.intervals.len() + 1
+        )?;
+        out.flush()
+    }
+}
+
 struct Presenter {
     swap_chain: IDXGISwapChain3,
+    // None disables logging; Some(None) waits for the first Present.
+    present_log: Option<Option<(u32, u32)>>,
     width: u32,
     height: u32,
     format: DXGI_FORMAT,
@@ -8871,6 +8940,7 @@ struct Presenter {
     /// The frame-rate limit (`[display] fps_limit`) and the last present.
     pacer: crate::display::Pacer,
     last_present: Option<std::time::Instant>,
+    times: Option<PresentTimes>,
 }
 
 /// The frame rate, shown in the window's caption every second and logged
@@ -9340,7 +9410,25 @@ impl Host {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
             let limited = p.pacer.wait();
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            let (sync_interval, flags) = (present_sync_interval(), DXGI_PRESENT(0));
+            if let Some(last) = &mut p.present_log {
+                let current = (sync_interval, flags.0);
+                if *last != Some(current) {
+                    tracing::info!(
+                        "VICTORY_LOG_PRESENT Present SyncInterval={sync_interval} Flags={:#x}",
+                        flags.0
+                    );
+                    *last = Some(current);
+                }
+            }
+            let presented = p.swap_chain.Present(sync_interval, flags);
+            if presented.is_ok()
+                && let Some(times) = &mut p.times
+                && let Err(error) = times.frame()
+            {
+                tracing::warn!(%error, "VICTORY_PRESENT_TIMES disabled after write failure");
+                p.times = None;
+            }
             let now = std::time::Instant::now();
             crate::display::note_present(p.last_present.map(|t| now.duration_since(t)), limited);
             p.last_present = Some(now);
@@ -9382,12 +9470,62 @@ impl Host {
             let swap_chain = factory
                 .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
                 .cast::<IDXGISwapChain3>()?;
+            let log_present = std::env::var_os("VICTORY_LOG_PRESENT").is_some_and(|v| v == "1");
+            if log_present {
+                match swap_chain.GetDesc1() {
+                    Ok(d) => {
+                        let effect = match d.SwapEffect {
+                            DXGI_SWAP_EFFECT_FLIP_DISCARD => "FLIP_DISCARD",
+                            DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL => "FLIP_SEQUENTIAL",
+                            DXGI_SWAP_EFFECT_DISCARD => "DISCARD",
+                            DXGI_SWAP_EFFECT_SEQUENTIAL => "SEQUENTIAL",
+                            _ => "unknown",
+                        };
+                        tracing::info!(
+                            "VICTORY_LOG_PRESENT SwapEffect={effect}({}) BufferCount={} Format={} Width={} Height={} SampleDesc={}/{}",
+                            d.SwapEffect.0, d.BufferCount, d.Format.0, d.Width, d.Height,
+                            d.SampleDesc.Count, d.SampleDesc.Quality
+                        );
+                        tracing::info!(
+                            "VICTORY_LOG_PRESENT SwapChainFlags={:#x} ALLOW_TEARING={} FRAME_LATENCY_WAITABLE_OBJECT={} Scaling={} AlphaMode={} Stereo={}",
+                            d.Flags,
+                            d.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING.0 as u32 != 0,
+                            d.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.0 as u32 != 0,
+                            d.Scaling.0, d.AlphaMode.0, d.Stereo.as_bool()
+                        );
+                    }
+                    Err(_) => tracing::info!(
+                        "VICTORY_LOG_PRESENT SwapEffect=unknown BufferCount=unknown Format=unknown Width=unknown Height=unknown SampleDesc=unknown SwapChainFlags=unknown ALLOW_TEARING=unknown FRAME_LATENCY_WAITABLE_OBJECT=unknown Scaling=unknown AlphaMode=unknown Stereo=unknown"
+                    ),
+                }
+                let latency = swap_chain
+                    .GetMaximumFrameLatency()
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|_| "unknown".into());
+                let mut info = WINDOWINFO {
+                    cbSize: std::mem::size_of::<WINDOWINFO>() as u32,
+                    ..Default::default()
+                };
+                let style = GetWindowInfo(hwnd, &mut info).ok().map(|()| info.dwExStyle);
+                let style_bit = |bit: WINDOW_EX_STYLE| {
+                    style
+                        .map(|v| (v.0 & bit.0 != 0).to_string())
+                        .unwrap_or_else(|| "unknown".into())
+                };
+                // No SetMaximumFrameLatency call exists in this host path.
+                tracing::info!(
+                    "VICTORY_LOG_PRESENT SetMaximumFrameLatency=not_called MaximumFrameLatency={latency} WS_EX_NOREDIRECTIONBITMAP={} layered={}",
+                    style_bit(WS_EX_NOREDIRECTIONBITMAP),
+                    style_bit(WS_EX_LAYERED)
+                );
+            }
             let copy = self.new_list()?;
             copy.close();
             tracing::info!(width, height, format = format.0, "presenting to a window");
             self.log_video_memory("right after the swap chain is made");
             Ok(Presenter {
                 swap_chain,
+                present_log: log_present.then_some(None),
                 width,
                 height,
                 format,
@@ -9397,6 +9535,8 @@ impl Host {
                 meter: Meter::new(),
                 pacer: crate::display::Pacer::new(crate::display::settings().fps_limit),
                 last_present: None,
+                times: std::env::var_os("VICTORY_PRESENT_TIMES")
+                    .map(|path| PresentTimes { path, ..Default::default() }),
             })
         }
     }
