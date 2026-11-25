@@ -105,6 +105,7 @@ with all of them, from about 120 ms in the morning. Still far from the console's
   2560x1440 as translated. With every pass of the layer's gone, this
   scene would still be near 20 frames a second on this card: the
   translated shaders have to get cheaper too.
+- `VICTORY_BATCH_PAGE_MAPPINGS=1` (off by default): maps consecutive texture-streaming pool pages in one host view, retrying individually on failure.
 - Measured and found to give nothing (switches left in, off):
   `VICTORY_REFRESH_ONCE`, `VICTORY_ASYNC_PRESENT`, `VICTORY_VIEW_KNOWN`,
   `VICTORY_SPREAD`, `VICTORY_QUEUE2=3`, `VICTORY_WINDOW_JUMP`. Each has an
