@@ -349,13 +349,23 @@ fn shaders(p: &Precompiled) -> Result<Vec<std::sync::Arc<super::Shader>>, (&'sta
 
 /// The method behind both slots.
 fn create_as(kind: Kind, desc: *const u8, iid: *const Iid, out: *mut This) -> HRESULT {
+    create_with(kind, desc, iid, out, mode(), graphics_wanted())
+}
+
+fn create_with(
+    kind: Kind,
+    desc: *const u8,
+    iid: *const Iid,
+    out: *mut This,
+    mode: Mode,
+    graphics_on: bool,
+) -> HRESULT {
     let counts = &COUNTS[kind as usize];
     let n = counts[CALLS].fetch_add(1, Ordering::Relaxed) + 1;
     if !out.is_null() {
         // SAFETY: the title's out pointer (a local of its own).
         unsafe { *out = std::ptr::null() };
     }
-    let mode = mode();
     if mode == Mode::Off {
         counts[REFUSED].fetch_add(1, Ordering::Relaxed);
         if n == 1 {
@@ -426,7 +436,7 @@ fn create_as(kind: Kind, desc: *const u8, iid: *const Iid, out: *mut This) -> HR
                         .collect();
                     names.join(" + ")
                 };
-                if !graphics_wanted() {
+                if !graphics_on {
                     // The title's own fallback makes this pipeline from its
                     // stream.
                     return refuse(
@@ -1004,5 +1014,70 @@ pub(crate) mod tests {
                 super::super::make::pipeline_key(&stream_order, Some(&g))
             );
         }
+    }
+
+    #[test]
+    fn graphics_precompiled_pipeline_decodes_state_and_hands_out_when_enabled() {
+        let _pack_guard = TEST_PACK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let ps = container_with_hash([0x91; 16], b"pixel_prog");
+        let ms = container_with_hash([0x92; 16], b"mesh_prog");
+        let archive = dir.path().join("shaders.rpf");
+        std::fs::write(
+            &archive,
+            crate::pipeline::pack::tests::archive_of(&[ps.clone(), ms.clone()]),
+        )
+        .unwrap();
+        pack::use_now(&archive);
+
+        // Build valid synthetic mesh GFX10 register block (dword 1 = 6, anchor at dword 50).
+        let mut reg_words = vec![0u32; 50 + 50];
+        reg_words[1] = 6;
+        reg_words[50] = pso_state::ANCHOR;
+        reg_words[50 + 2] = 0xcc << 16; // CB_COLOR_CONTROL: ROP3 copy
+        reg_words[50 + 17] = (1 << 1) | (1 << 3) | (6 << 4); // DB_DEPTH_CONTROL: depth + bounds
+        reg_words[50 + 22] = 0x0000_000f; // CB_TARGET_MASK: target 0 RGBA
+        let regs: Vec<u8> = reg_words.iter().flat_map(|w| w.to_le_bytes()).collect();
+
+        // Build valid synthetic description block (1 target format 28, depth 20, triangle topo).
+        let mut desc = vec![0u8; 0x50];
+        desc[0x10] = 28;
+        desc[0x1c..0x20].copy_from_slice(&u32::MAX.to_le_bytes());
+        let packed = 20u32 | (1u32 << 8) | (3u32 << 16);
+        desc[0x24..0x28].copy_from_slice(&packed.to_le_bytes());
+        desc[0x28..0x2c].copy_from_slice(&1u32.to_le_bytes());
+        desc[0x38..0x3c].copy_from_slice(&4u32.to_le_bytes()); // empty input layout = 4 B count
+        desc[0x3c..0x40].copy_from_slice(&12u32.to_le_bytes()); // empty stream output
+
+        let ps_code = [0x90u8; 0x40];
+        let ps_meta = meta_naming([0x91; 16]);
+        let ms_code = [0x90u8; 0x40];
+        let ms_meta = meta_naming([0x92; 16]);
+        let pair = |b: &[u8]| [b.as_ptr() as usize, b.len()];
+        let mut words = vec![0x77usize];
+        for b in [&regs[..], &desc, &ps_code, &ps_meta] {
+            words.extend(pair(b));
+        }
+        words.extend([0, 0, 0, 0]); // slot 1 (vertex) unused
+        words.extend(pair(&ms_code));
+        words.extend(pair(&ms_meta));
+
+        let iid = crate::pipeline::PIPELINE_IIDS[0];
+        let mut out = std::ptr::null();
+        let hr = create_with(Kind::Graphics, words.as_ptr().cast(), &iid, &mut out, Mode::Real, true);
+        assert_eq!(hr, S_OK);
+        assert!(!out.is_null());
+        let p = super::super::pipeline(out);
+        assert_eq!(p.precompiled.as_ref().unwrap().kind, Kind::Graphics);
+        let stages: Vec<&str> = p.shaders.iter().map(|s| s.stage).collect();
+        assert_eq!(stages, ["mesh", "pixel"]);
+        #[cfg(windows)]
+        {
+            let g = p.host.graphics.as_deref().expect("decoded GraphicsState");
+            assert_eq!(g.targets.NumRenderTargets, 1);
+            assert_eq!(g.topology.0, 3);
+            assert!(g.describe().contains("depth-bounds"));
+        }
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(out, 0x10)(out), 0);
     }
 }

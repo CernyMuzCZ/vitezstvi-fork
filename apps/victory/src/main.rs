@@ -281,3 +281,59 @@ pub(crate) fn default_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
     );
     Ok(all)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn precompile_graphics_cli_parses_flags_and_defaults() {
+        let cli = Cli::try_parse_from([
+            "victory",
+            "precompile-graphics",
+            "shaders.rpf",
+            "--jobs",
+            "12",
+            "--limit",
+            "500",
+            "--skip",
+            "25",
+            "--mesh",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::PrecompileGraphics {
+                archive,
+                jobs,
+                limit,
+                skip,
+                mesh,
+            } => {
+                assert_eq!(archive, Some(PathBuf::from("shaders.rpf")));
+                assert_eq!(jobs, Some(12));
+                assert_eq!(limit, Some(500));
+                assert_eq!(skip, 25);
+                assert!(mesh);
+            }
+            _ => panic!("expected PrecompileGraphics command"),
+        }
+
+        let defaults = Cli::try_parse_from(["victory", "precompile-graphics"]).unwrap();
+        match defaults.command {
+            Command::PrecompileGraphics {
+                archive,
+                jobs,
+                limit,
+                skip,
+                mesh,
+            } => {
+                assert_eq!(archive, None);
+                assert_eq!(jobs, None);
+                assert_eq!(limit, None);
+                assert_eq!(skip, 0);
+                assert!(!mesh);
+            }
+            _ => panic!("expected PrecompileGraphics command"),
+        }
+    }
+}

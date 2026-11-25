@@ -688,7 +688,7 @@ mod tests {
         // Front pass = hw 3 (REPLACE -> 3); back fail = hw 1 (ZERO -> 2), pass = hw 5 (INCR_SAT -> 4).
         regs.set(at::DB_STENCIL_CONTROL, (3 << 4) | (1 << 12) | (5 << 16));
         regs.set(at::DB_STENCILREFMASK, (0xff << 8) | (0xff << 16));
-        regs.set(at::SX_PS_DOWNCONVERT, 0 | (5 << 4) | (9 << 8));
+        regs.set(at::SX_PS_DOWNCONVERT, (5 << 4) | (9 << 8));
         let a = regs.build();
         let b = desc_block(&[29, 28, 34], 20, 3, u32::MAX, 1, &[]);
         let d = decode(&a, &b).unwrap();
@@ -783,6 +783,20 @@ mod tests {
         assert_eq!(stencil_op(3), Ok(3));
         assert_eq!(logic_op(0xcc), Ok(None));
         assert_eq!(logic_op(0x66), Ok(Some(10)));
+    }
+
+    #[test]
+    fn a_logic_op_pipeline_decodes_rop3_on_targets() {
+        let mut regs = RegBuilder::new(false);
+        // ROP3 = 0x66 (XOR -> D3D12_LOGIC_OP_XOR = 10), write mask only on target 0.
+        regs.set(at::CB_COLOR_CONTROL, 0x66 << 16);
+        regs.set(at::CB_TARGET_MASK, 0x0000_000f);
+        let a = regs.build();
+        let b = desc_block(&[28], 0, 3, u32::MAX, 1, &[]);
+        let d = decode(&a, &b).unwrap();
+        assert!(d.targets_blend[0].logic_op_enable);
+        assert_eq!(d.targets_blend[0].logic_op, 10);
+        assert!(!d.targets_blend[0].blend);
     }
 
     /// Every record of the title's file (path in `VICTORY_PSO_CACHE` for an

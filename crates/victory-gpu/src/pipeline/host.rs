@@ -169,6 +169,15 @@ impl GraphicsState {
     /// is set for a RenderTarget above 0").
     pub(crate) fn host_blend(&self) -> D3D12_BLEND_DESC {
         let mut blend = self.blend;
+        // D3D12 forbids LogicOpEnable together with IndependentBlendEnable
+        // (or BlendEnable): decoded GFX10 registers can mark targets 1..7 with
+        // a 0 write mask, setting IndependentBlendEnable even when target 0
+        // uses a logic op.
+        if blend.RenderTarget[0].LogicOpEnable.as_bool() {
+            blend.IndependentBlendEnable = false.into();
+            blend.RenderTarget[0].BlendEnable = false.into();
+            return blend;
+        }
         if dual_source(&blend.RenderTarget[0]) {
             for t in &mut blend.RenderTarget[1..] {
                 *t = D3D12_RENDER_TARGET_BLEND_DESC {
@@ -1447,6 +1456,24 @@ mod tests {
             // The state a run names the pipeline by is not changed.
             assert_eq!(g.blend.RenderTarget[7].DestBlend, D3D12_BLEND_INV_SRC1_COLOR);
         }
+    }
+
+    #[test]
+    fn logic_op_disables_independent_blend_for_host() {
+        let mut g = GraphicsState::default();
+        g.blend.IndependentBlendEnable = true.into();
+        g.blend.RenderTarget[0].LogicOpEnable = true.into();
+        g.blend.RenderTarget[0].LogicOp = D3D12_LOGIC_OP_XOR;
+        g.blend.RenderTarget[1].RenderTargetWriteMask = 0;
+        g.targets.NumRenderTargets = 1;
+        g.targets.RTFormats[0] = DXGI_FORMAT_R32_UINT;
+        let b = g.host_blend();
+        assert!(!b.IndependentBlendEnable.as_bool());
+        assert!(!b.RenderTarget[0].BlendEnable.as_bool());
+        assert!(b.RenderTarget[0].LogicOpEnable.as_bool());
+        assert_eq!(b.RenderTarget[0].LogicOp, D3D12_LOGIC_OP_XOR);
+        // Original state kept intact for pipeline library naming.
+        assert!(g.blend.IndependentBlendEnable.as_bool());
     }
 
     /// The host refuses a pipeline that blends into an integer target; with
