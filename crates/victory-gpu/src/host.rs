@@ -9075,6 +9075,8 @@ struct Presenter {
     pacer: crate::display::Pacer,
     last_present: Option<std::time::Instant>,
     times: Option<PresentTimes>,
+    /// The pass that blends a second present plane, once one is presented.
+    compose: Option<crate::compose::Compose>,
 }
 
 /// The frame rate, shown in the window's caption every second and logged
@@ -9420,14 +9422,28 @@ impl Host {
     /// Shows `texture`, which is in `state` (a host state) and stays in it,
     /// as frame `frame` (saved if captures are on). `None` if nothing was
     /// shown; else, in diagnostics builds, whether the frame was black.
-    pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+    /// `interface`: the second present plane and its state, blended over
+    /// `texture` (`crate::compose`).
+    pub(crate) fn present(
+        &self,
+        texture: &ID3D12Resource,
+        state: u32,
+        interface: Option<(&ID3D12Resource, u32)>,
+        frame: u64,
+    ) -> Option<bool> {
         let showing = std::time::Instant::now();
-        let shown = self.present_now(texture, state, frame);
+        let shown = self.present_now(texture, state, interface, frame);
         crate::framelog::add(crate::framelog::T::PresentShowUs, showing.elapsed().as_micros() as u64);
         shown
     }
 
-    fn present_now(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+    fn present_now(
+        &self,
+        texture: &ID3D12Resource,
+        state: u32,
+        interface: Option<(&ID3D12Resource, u32)>,
+        frame: u64,
+    ) -> Option<bool> {
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let Some(format) = swap_format(desc.Format) else {
@@ -9503,34 +9519,104 @@ impl Host {
             };
             copy.reset();
             let list = &copy.list;
-            list.ResourceBarrier(&[
-                transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                ),
-            ]);
-            list.CopyResource(&back, texture);
-            // The frame rate, into the corner of what is shown (not of the
-            // title's own frame, which the lines below read back).
-            crate::fpsbox::draw(self, list, &back, (width, height, format));
+            static NO_COMPOSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            let mut composed = false;
+            if let Some((overlay, overlay_state)) = interface
+                && !NO_COMPOSE.load(Ordering::Relaxed)
+            {
+                if p.compose.as_ref().is_none_or(|c| c.format() != p.format) {
+                    p.compose = match crate::compose::Compose::new(&self.device, p.format) {
+                        Ok(c) => Some(c),
+                        Err(e) => {
+                            NO_COMPOSE.store(true, Ordering::Relaxed);
+                            tracing::warn!(error = %e, "no pass to blend the second present plane; only the first is shown");
+                            None
+                        }
+                    };
+                }
+                if let Some(c) = p.compose.as_mut() {
+                    c.record(
+                        &self.device,
+                        list,
+                        &back,
+                        (p.width, p.height),
+                        texture,
+                        state.0 as u32,
+                        overlay,
+                        overlay_state,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                    );
+                    composed = true;
+                }
+            }
+            if !composed {
+                list.ResourceBarrier(&[
+                    transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                    transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_PRESENT,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                    ),
+                ]);
+                list.CopyResource(&back, texture);
+            }
             #[cfg(feature = "diagnostics")]
-            let capture = crate::capture::wanted(frame)
-                .then(|| crate::capture::read_back(&self.device, list, texture))
-                .flatten();
-            #[cfg(feature = "diagnostics")]
-            let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, texture) };
+            let (capture, probe) = if composed {
+                let want_cap = crate::capture::wanted(frame);
+                let want_probe = slot.is_none();
+                if want_cap || want_probe {
+                    list.ResourceBarrier(&[transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    )]);
+                    let cap = want_cap
+                        .then(|| crate::capture::read_back(&self.device, list, &back))
+                        .flatten();
+                    let prb = want_probe
+                        .then(|| crate::capture::probe(&self.device, list, &back))
+                        .flatten();
+                    list.ResourceBarrier(&[transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                    )]);
+                    (cap, prb)
+                } else {
+                    (None, None)
+                }
+            } else {
+                let cap = crate::capture::wanted(frame)
+                    .then(|| crate::capture::read_back(&self.device, list, texture))
+                    .flatten();
+                let prb = if slot.is_some() {
+                    None
+                } else {
+                    crate::capture::probe(&self.device, list, texture)
+                };
+                (cap, prb)
+            };
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
-            list.ResourceBarrier(&[
-                transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
-                transition(
+            // The frame rate, into the corner of what is shown (not of the
+            // title's own frame, which the lines above read back).
+            crate::fpsbox::draw(self, list, &back, (width, height, format));
+            if composed {
+                list.ResourceBarrier(&[transition(
                     &back,
                     D3D12_RESOURCE_STATE_COPY_DEST,
                     D3D12_RESOURCE_STATE_PRESENT,
-                ),
-            ]);
+                )]);
+            } else {
+                list.ResourceBarrier(&[
+                    transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
+                    transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_PRESENT,
+                    ),
+                ]);
+            }
             copy.close();
             match slot {
                 Some(i) => {
@@ -9671,6 +9757,7 @@ impl Host {
                 last_present: None,
                 times: std::env::var_os("VICTORY_PRESENT_TIMES")
                     .map(|path| PresentTimes { path, ..Default::default() }),
+                compose: None,
             })
         }
     }

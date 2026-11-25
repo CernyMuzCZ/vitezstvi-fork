@@ -13,8 +13,6 @@
 //! plane over it with premultiplied alpha, as display planes take it
 //! (`VICTORY_PLANE_ALPHA=straight`: straight alpha instead).
 
-#![allow(dead_code)]
-
 use std::sync::OnceLock;
 
 use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
