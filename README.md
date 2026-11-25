@@ -310,6 +310,7 @@ Speed and memory:
 - Title memory can be opened as a graphics heap so that buffers are used in place instead of copied (`VICTORY_INPLACE`, first stage only; a probe confirmed the approach on the test GPU).
 - The bindless texture queue no longer uploads stale views; the view table no longer grows without bound; the pipeline library is mapped instead of read into memory.
 - An intermittent device loss was traced to the pipeline library file being replaced while mapped; fixed.
+- Indirect records are clamped into a ring of the list's, each clamp into room of its own behind one barrier of the enhanced kind, where the host takes them (`VICTORY_INDIRECT_RING=0` turns it off): in a timing run of the gameplay's opening, the clamps 33 → 19 ms of card time a frame. The clamps of records no shader of the list wrote before the command run in the list's prelude, together, before the list (`VICTORY_INDIRECT_EARLY=0` turns it off): our clamps took 6.8 ms of card time a frame at the start of the gameplay before, and about 1.25 ms after (0.5 in the lists, 0.75 in the preludes), in timing runs of two builds of our tree.
 
 - Translated shaders get clean-up passes over the finished module (dead code, constant folding, reuse of values, branch facts); the pack's host instruction count falls by about 43 %, worth about 20 ms of GPU time per frame on the test machine (`VICTORY_SHADER_OPT=0` turns them off).
 
