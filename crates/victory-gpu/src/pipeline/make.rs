@@ -141,7 +141,11 @@ pub(crate) fn now(p: &Arc<Pending>) -> bool {
 /// run drew with it (during loading, so the world's first frames find it),
 /// unless memory commit headroom is too tight for speculative prewarming.
 pub(crate) fn early(p: &Arc<Pending>) {
-    if !p.shaders.is_empty()
+    // Turning off speculative starts keeps first-use scheduling and the disk caches available.
+    static PREWARM: OnceLock<bool> = OnceLock::new();
+    let enabled = *PREWARM.get_or_init(|| std::env::var_os("VICTORY_EARLY_PIPELINES").is_none_or(|v| v != "0"));
+    if enabled
+        && !p.shaders.is_empty()
         && super::library::wanted_early(&p.key)
         && current_commit_budget(1).1
     {
