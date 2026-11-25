@@ -189,7 +189,7 @@ struct Pair {
 /// # Safety
 /// A non-null `data` of a non-zero `size` up to `MAX_BLOCK` is readable.
 unsafe fn bytes<'a>(pair: Pair) -> Option<&'a [u8]> {
-    if pair.data.is_null() || pair.size == 0 || pair.size > MAX_BLOCK {
+    if pair.data.is_null() || !(1..=MAX_BLOCK).contains(&pair.size) {
         return None;
     }
     // SAFETY: the caller's.

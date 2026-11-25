@@ -244,7 +244,7 @@ fn scan_windows<R: std::io::Read + std::io::Seek>(
                 u32::from_le_bytes(head[4 * i..4 * i + 4].try_into().expect("4 bytes")) as usize
             };
             let n = word(0);
-            if n != word(2) || n < 12 || n > MAX_UNPACKED || marker + n > len {
+            if n != word(2) || !(12..=MAX_UNPACKED).contains(&n) || marker + n > len {
                 continue;
             }
             let from = marker - 6;
