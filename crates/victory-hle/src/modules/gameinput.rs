@@ -1937,11 +1937,30 @@ mod host {
             (Instant::now(), keys.collect())
         });
         let (start, keys) = &*SCRIPT;
-        let now = start.elapsed();
-        keys.iter()
-            .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
-            .map(|&(_, vk)| vk)
-            .collect()
+        active_scripted_keys(keys, start.elapsed())
+    }
+
+    #[cfg(any(test, feature = "diagnostics"))]
+    fn active_scripted_keys(keys: &[(Duration, u8)], now: Duration) -> Vec<u8> {
+        let mut down = Vec::new();
+        for &(at, vk) in keys {
+            if now.checked_sub(at).is_some_and(|age| age < Duration::from_millis(200))
+                && !down.contains(&vk)
+            {
+                down.push(vk);
+            }
+        }
+        down
+    }
+
+    #[test]
+    fn overlapping_scripted_presses_hold_one_key_until_both_end() {
+        let ms = Duration::from_millis;
+        let keys = [(ms(0), b'W'), (ms(50), b'A'), (ms(100), b'W')];
+        assert_eq!(active_scripted_keys(&keys, ms(100)), b"WA");
+        assert_eq!(active_scripted_keys(&keys, ms(249)).len(), 2);
+        assert_eq!(active_scripted_keys(&keys, ms(250)), b"W");
+        assert!(active_scripted_keys(&keys, ms(300)).is_empty());
     }
 
     /// Debugging aid: `VICTORY_KBM_SCRIPT=<seconds>:<key>[*<hold seconds>],...`
