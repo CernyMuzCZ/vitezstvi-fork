@@ -223,6 +223,10 @@ impl Output {
         size == [footprint.Width, footprint.Height]
     }
 
+    pub(super) fn float_resource(&self) -> &ID3D12Resource {
+        &self.float
+    }
+
     pub(super) fn sdk_resource(&self, list: &HostList) -> Resource {
         // The SDK can record references even if dispatch returns an error.
         list.keep(&self.float);

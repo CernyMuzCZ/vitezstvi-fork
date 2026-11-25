@@ -1,23 +1,29 @@
 //! The title's FidelityFX upscaler calls answered by AMD's PC FidelityFX
 //! loader for D3D12, `amd_fidelityfx_loader_dx12.dll` from the public
 //! FidelityFX SDK (2.x, `Kits/FidelityFX/signedbin`), in the folder
-//! `VICTORY_FFX_DIR` names.
+//! `VICTORY_FFX_DIR` names, or by NVIDIA Streamline DLSS 4.5 Super Resolution
+//! when `VICTORY_DLSS_SR=1` and `VICTORY_STREAMLINE_DIR` are set.
 //!
 //! The console's FidelityFX API has the PC API's structure layouts. Its
 //! upscaler DLL only carries the fixed 1920x1080 Quality tables: a Series X
 //! configuration made to pick it (3840x2160 output) gets "maxUpscaleSize
 //! must be 1920x1080" and the title stops. Here the title's descriptions go
-//! to the PC loader with the console objects swapped for the host's: the
-//! console backend description for the DX12 one on the host device, the
-//! command list for the host list behind the title's, and every texture for
-//! its host copy, moved to the state the upscaler reads (inputs) or writes
-//! (output) on entry. The PC upscaler leaves them in those states.
+//! to the PC loader (or NVIDIA Streamline) with the console objects swapped
+//! for the host's: the console backend description for the DX12 one on the
+//! host device, the command list for the host list behind the title's, and
+//! every texture for its host copy, moved to the state the upscaler reads
+//! (inputs) or writes (output) on entry. The PC upscaler leaves them in those
+//! states.
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
+use windows::Win32::Graphics::Direct3D12::{
+    D3D12_RESOURCE_STATE_UNORDERED_ACCESS, ID3D12Resource,
+};
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows::core::{Interface, PCSTR, PCWSTR};
 
@@ -40,11 +46,46 @@ pub struct Header {
 const CREATE_UPSCALE: u64 = 0x0001_0000;
 const DISPATCH_UPSCALE: u64 = 0x0001_0001;
 const QUERY_GET_VERSIONS: u64 = 4;
+const QUERY_GET_PROVIDER_VERSION: u64 = 6;
+const QUERY_GET_UPSCALE_RATIO: u64 = 0x0001_0002;
+const QUERY_GET_RENDER_RESOLUTION: u64 = 0x0001_0003;
 const QUERY_JITTER_PHASE_COUNT: u64 = 0x0001_0004;
+const QUERY_GET_JITTER_OFFSET: u64 = 0x0001_0005;
+const QUERY_GET_RESOURCE_REQUIREMENTS: u64 = 0x0001_000a;
 /// The console's backend description; the device is at +0x10, as in the
 /// PC's DX12 one.
 const CONSOLE_BACKEND: u64 = 0x0100_0002;
 const BACKEND_DX12: u64 = 2;
+
+const DLSS_PROVIDER_ID: u64 = 0x0004_0500;
+const DLSS_PROVIDER_NAME: &std::ffi::CStr = c"NVIDIA DLSS 4.5 (Streamline)";
+
+#[derive(Clone, Copy)]
+struct ContextInfo {
+    is_dlss: bool,
+    flags: u32,
+}
+
+fn contexts() -> &'static Mutex<HashMap<usize, ContextInfo>> {
+    static CONTEXTS: OnceLock<Mutex<HashMap<usize, ContextInfo>>> = OnceLock::new();
+    CONTEXTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn context_info(context: *mut *mut c_void) -> Option<ContextInfo> {
+    if context.is_null() {
+        return None;
+    }
+    // SAFETY: caller validated non-null `context` pointer.
+    let ptr = unsafe { *context };
+    if ptr.is_null() {
+        return None;
+    }
+    contexts()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(ptr as usize))
+        .copied()
+}
 
 /// `ffxCreateBackendDX12Desc`.
 #[repr(C)]
@@ -135,9 +176,12 @@ struct Api {
     dispatch: Dispatch,
 }
 
-/// Whether the title's FidelityFX calls come here: `VICTORY_FFX_DIR` set.
+/// Whether the title's FidelityFX calls come here: `VICTORY_FFX_DIR` set or
+/// NVIDIA Streamline DLSS SR / DLSS-G enabled.
 pub fn enabled() -> bool {
     std::env::var_os("VICTORY_FFX_DIR").is_some()
+        || crate::dlss::sr_enabled()
+        || crate::dlss::fg_enabled()
 }
 
 /// AMD's loader, loaded on first use. The upscaler it picks is loaded by
@@ -187,7 +231,14 @@ impl WideNul for std::ffi::OsStr {
 }
 
 fn host_device() -> Option<*mut c_void> {
-    crate::host::host().map(|h| h.device.as_raw())
+    crate::host::host().map(|h| crate::dlss::native_d3d12_device(&h.device))
+}
+
+fn dlss_sr_ready() -> bool {
+    crate::dlss::sr_enabled()
+        && crate::dlss::streamline::runtime()
+            .and_then(|rt| rt.feature_fns())
+            .is_some_and(|fns| fns.dlss_supported)
 }
 
 /// Logs a description type the first time it is seen.
@@ -228,7 +279,7 @@ pub extern "C" fn ffxCreateContext(
     desc: *mut Header,
     _memory: *const c_void,
 ) -> ReturnCode {
-    let (Some(api), Some(device)) = (api(), host_device()) else {
+    let Some(device) = host_device() else {
         return ERROR;
     };
     if context.is_null() || desc.is_null() {
@@ -237,6 +288,32 @@ pub extern "C" fn ffxCreateContext(
     // SAFETY: the title's chain of descriptions.
     let Some(mut upscale) = (unsafe { upscale_in(desc) }) else {
         return ERROR_PARAMETER;
+    };
+    if dlss_sr_ready() {
+        let sentinel = Box::into_raw(Box::new(0x444c_5353_u64)).cast::<c_void>();
+        // SAFETY: `context` was checked non-null above.
+        unsafe { *context = sentinel };
+        contexts().lock().unwrap_or_else(|e| e.into_inner()).insert(
+            sentinel as usize,
+            ContextInfo {
+                is_dlss: true,
+                flags: upscale.flags,
+            },
+        );
+        tracing::info!(
+            render = ?upscale.max_render,
+            upscale = ?upscale.max_upscale,
+            flags = upscale.flags,
+            result = OK,
+            provider = "NVIDIA DLSS 4.5 (Streamline)",
+            "ffx: upscale context on the host GPU"
+        );
+        return OK;
+    } else if crate::dlss::sr_enabled() {
+        tracing::warn!("ffx: VICTORY_DLSS_SR=1 requested but Streamline DLSS is unavailable; falling back to AMD FFX if configured");
+    }
+    let Some(api) = api() else {
+        return ERROR;
     };
     // The console's version and provider descriptions name console builds;
     // the PC loader picks the newest upscaler the GPU runs.
@@ -250,6 +327,19 @@ pub extern "C" fn ffxCreateContext(
     upscale.next = (&raw mut dx12).cast();
     // SAFETY: the SDK's call with a chain that outlives it.
     let r = unsafe { (api.create)(context, (&raw mut upscale).cast(), std::ptr::null()) };
+    if r == OK {
+        // SAFETY: `context` was checked non-null above.
+        let raw = unsafe { *context };
+        if !raw.is_null() {
+            contexts().lock().unwrap_or_else(|e| e.into_inner()).insert(
+                raw as usize,
+                ContextInfo {
+                    is_dlss: false,
+                    flags: upscale.flags,
+                },
+            );
+        }
+    }
     let provider = provider_name(context);
     tracing::info!(
         render = ?upscale.max_render, upscale = ?upscale.max_upscale, flags = upscale.flags, result = r, provider,
@@ -271,7 +361,7 @@ fn provider_name(context: *mut *mut c_void) -> String {
         return String::new();
     };
     let mut q = ProviderVersion {
-        kind: 6,
+        kind: QUERY_GET_PROVIDER_VERSION,
         next: std::ptr::null_mut(),
         id: 0,
         name: std::ptr::null(),
@@ -294,31 +384,212 @@ pub extern "C" fn ffxDestroyContext(
     context: *mut *mut c_void,
     _memory: *const c_void,
 ) -> ReturnCode {
+    if !context.is_null() {
+        // SAFETY: `context` was checked non-null.
+        let raw = unsafe { *context };
+        if !raw.is_null()
+            && let Some(info) = contexts()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&(raw as usize))
+            && info.is_dlss
+        {
+            // SAFETY: `raw` was created via `Box::into_raw(Box::new(u64))` in `ffxCreateContext`.
+            unsafe {
+                drop(Box::from_raw(raw.cast::<u64>()));
+                *context = std::ptr::null_mut();
+            }
+            crate::dlss::free_sr_resources();
+            return OK;
+        }
+    }
     let Some(api) = api() else { return ERROR };
     // SAFETY: a context this module created.
     unsafe { (api.destroy)(context, std::ptr::null()) }
 }
 
 pub extern "C" fn ffxConfigure(context: *mut *mut c_void, desc: *const Header) -> ReturnCode {
-    let Some(api) = api() else { return ERROR };
     if !desc.is_null() {
         // SAFETY: the title's description.
         note("ffxConfigure", unsafe { (*desc).kind });
     }
+    if context_info(context).is_some_and(|c| c.is_dlss) {
+        return OK;
+    }
+    let Some(api) = api() else { return ERROR };
     // SAFETY: passed on as the title made it.
     unsafe { (api.configure)(context, desc) }
 }
 
+/// Answers standard FFX upscale queries directly when NVIDIA DLSS 4.5 SR runs
+/// standalone without an AMD FFX loader DLL.
+///
+/// # Safety
+///
+/// `desc` must be a valid pointer to a query descriptor matching `kind`.
+unsafe fn answer_dlss_query(kind: u64, desc: *mut Header) -> ReturnCode {
+    #[repr(C)]
+    struct ProviderVersion {
+        kind: u64,
+        next: *mut Header,
+        id: u64,
+        name: *const i8,
+    }
+    #[repr(C)]
+    struct UpscaleRatio {
+        kind: u64,
+        next: *mut Header,
+        quality_mode: u32,
+        out_ratio: *mut f32,
+    }
+    #[repr(C)]
+    struct RenderResolution {
+        kind: u64,
+        next: *mut Header,
+        display_width: u32,
+        display_height: u32,
+        quality_mode: u32,
+        out_render_width: *mut u32,
+        out_render_height: *mut u32,
+    }
+    #[repr(C)]
+    struct JitterPhaseCount {
+        kind: u64,
+        next: *mut Header,
+        render_width: u32,
+        display_width: u32,
+        out: *mut i32,
+    }
+    #[repr(C)]
+    struct JitterOffset {
+        kind: u64,
+        next: *mut Header,
+        index: i32,
+        phase_count: i32,
+        out_x: *mut f32,
+        out_y: *mut f32,
+    }
+    #[repr(C)]
+    struct ResourceRequirements {
+        kind: u64,
+        next: *mut Header,
+        required_resources: u64,
+        optional_resources: u64,
+    }
+
+    match kind {
+        QUERY_GET_VERSIONS => {
+            // SAFETY: caller guarantees `desc` matches `GetVersions`.
+            let q = unsafe { &mut *desc.cast::<GetVersions>() };
+            if !q.count.is_null() {
+                // SAFETY: caller's writable count pointer.
+                let cap = unsafe { *q.count };
+                // SAFETY: writing available count (1).
+                unsafe { *q.count = 1 };
+                if cap >= 1 {
+                    if !q.ids.is_null() {
+                        // SAFETY: caller's output array has at least 1 slot.
+                        unsafe { *q.ids = DLSS_PROVIDER_ID };
+                    }
+                    if !q.names.is_null() {
+                        // SAFETY: caller's output array has at least 1 slot; static C string.
+                        unsafe { *q.names = DLSS_PROVIDER_NAME.as_ptr() };
+                    }
+                }
+            }
+            OK
+        }
+        QUERY_GET_PROVIDER_VERSION => {
+            // SAFETY: caller guarantees `desc` matches `ProviderVersion`.
+            let q = unsafe { &mut *desc.cast::<ProviderVersion>() };
+            q.id = DLSS_PROVIDER_ID;
+            q.name = DLSS_PROVIDER_NAME.as_ptr();
+            OK
+        }
+        QUERY_GET_UPSCALE_RATIO => {
+            // SAFETY: caller guarantees `desc` matches `UpscaleRatio`.
+            let q = unsafe { &*desc.cast::<UpscaleRatio>() };
+            if q.out_ratio.is_null() {
+                return ERROR_PARAMETER;
+            }
+            // SAFETY: caller's output float pointer.
+            unsafe { *q.out_ratio = crate::dlss::sr::upscale_ratio_for_quality_mode(q.quality_mode) };
+            OK
+        }
+        QUERY_GET_RENDER_RESOLUTION => {
+            // SAFETY: caller guarantees `desc` matches `RenderResolution`.
+            let q = unsafe { &*desc.cast::<RenderResolution>() };
+            if q.out_render_width.is_null() || q.out_render_height.is_null() {
+                return ERROR_PARAMETER;
+            }
+            let ratio = crate::dlss::sr::upscale_ratio_for_quality_mode(q.quality_mode);
+            let rw = ((q.display_width as f32 / ratio).round() as u32).max(1);
+            let rh = ((q.display_height as f32 / ratio).round() as u32).max(1);
+            // SAFETY: caller's output dimension pointers.
+            unsafe {
+                *q.out_render_width = rw;
+                *q.out_render_height = rh;
+            }
+            OK
+        }
+        QUERY_JITTER_PHASE_COUNT => {
+            // SAFETY: caller guarantees `desc` matches `JitterPhaseCount`.
+            let q = unsafe { &*desc.cast::<JitterPhaseCount>() };
+            if q.out.is_null() {
+                return ERROR_PARAMETER;
+            }
+            // SAFETY: caller's output pointer.
+            unsafe {
+                *q.out = crate::dlss::sr::jitter_phase_count(q.render_width, q.display_width);
+            }
+            OK
+        }
+        QUERY_GET_JITTER_OFFSET => {
+            // SAFETY: caller guarantees `desc` matches `JitterOffset`.
+            let q = unsafe { &*desc.cast::<JitterOffset>() };
+            if q.out_x.is_null() || q.out_y.is_null() {
+                return ERROR_PARAMETER;
+            }
+            let (jx, jy) = crate::dlss::sr::halton_jitter_offset(q.index, q.phase_count);
+            // SAFETY: caller's output float pointers.
+            unsafe {
+                *q.out_x = jx;
+                *q.out_y = jy;
+            }
+            OK
+        }
+        QUERY_GET_RESOURCE_REQUIREMENTS => {
+            // SAFETY: caller guarantees `desc` matches `ResourceRequirements`.
+            let q = unsafe { &mut *desc.cast::<ResourceRequirements>() };
+            q.required_resources = 0b0000_0111; // color, depth, motion vectors
+            q.optional_resources = 0b0011_1000; // exposure, reactive, transparency
+            OK
+        }
+        _ => ERROR_PARAMETER,
+    }
+}
+
 pub extern "C" fn ffxQuery(context: *mut *mut c_void, desc: *mut Header) -> ReturnCode {
-    let (Some(api), Some(device)) = (api(), host_device()) else {
-        return ERROR;
-    };
     if desc.is_null() {
         return ERROR_PARAMETER;
     }
     // SAFETY: the title's description.
     let kind = unsafe { (*desc).kind };
     note("ffxQuery", kind);
+
+    let Some(device) = host_device() else {
+        return ERROR;
+    };
+    let is_dlss_ctx = context_info(context).is_some_and(|c| c.is_dlss);
+    if is_dlss_ctx || (dlss_sr_ready() && api().is_none()) {
+        // SAFETY: `desc` was checked non-null and `kind` was read from its header.
+        let r = unsafe { answer_dlss_query(kind, desc) };
+        log_query(kind, desc, r);
+        return r;
+    }
+    let Some(api) = api() else {
+        return ERROR;
+    };
     if kind == QUERY_GET_VERSIONS {
         // It names the device to enumerate for: the host's.
         // SAFETY: a description of this type.
@@ -394,9 +665,15 @@ fn log_query(kind: u64, desc: *mut Header, r: ReturnCode) {
 }
 
 pub extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *const Header) -> ReturnCode {
-    let Some(api) = api() else { return ERROR };
     if context.is_null() || desc.is_null() {
         return ERROR_PARAMETER;
+    }
+    let ctx_info = context_info(context).unwrap_or(ContextInfo {
+        is_dlss: false,
+        flags: 0,
+    });
+    if !ctx_info.is_dlss && api().is_none() {
+        return ERROR;
     }
     // SAFETY: the title's description.
     let kind = unsafe { (*desc).kind };
@@ -432,9 +709,11 @@ pub extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *const Header) ->
     } else {
         None
     };
+    let mut host_slots: [Option<&ID3D12Resource>; 7] = [None; 7];
     for (i, r) in d.resources.iter_mut().enumerate() {
         if i == OUTPUT && let Some(packed) = packed_output {
             *r = packed.sdk_resource(list);
+            host_slots[OUTPUT] = Some(packed.float_resource());
             continue;
         }
         if r.resource.is_null() {
@@ -461,13 +740,65 @@ pub extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *const Header) ->
         }
         r.resource = texture.as_raw();
         r.state = ffx;
+        host_slots[i] = Some(texture);
     }
     if d.resources[0].resource.is_null() || d.resources[OUTPUT].resource.is_null() {
         return ERROR_PARAMETER;
     }
     d.command_list = list.list.as_raw();
-    // SAFETY: the SDK's call on an open host list with live textures.
-    let r = unsafe { (api.dispatch)(context, (&raw const d).cast()) };
+
+    let hudless = host_slots[OUTPUT].map(|res| (res, D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
+    let dlss_params = if let (Some(color_in), Some(depth), Some(mvec), Some(color_out)) = (
+        host_slots[0],
+        host_slots[1],
+        host_slots[2],
+        host_slots[OUTPUT],
+    ) {
+        Some(crate::dlss::sr::UpscaleFrameParams {
+            color_in,
+            color_out,
+            depth,
+            mvec,
+            exposure: host_slots[3],
+            reactive: host_slots[4],
+            transparency: host_slots[5],
+            jitter: d.jitter,
+            motion_vector_scale: d.motion_vector_scale,
+            render_size: d.render_size,
+            upscale_size: d.upscale_size,
+            pre_exposure: d.pre_exposure,
+            sharpness: if d.sharpening { d.sharpness } else { 0.0 },
+            reset: d.reset,
+            camera: d.camera,
+            create_flags: ctx_info.flags,
+        })
+    } else {
+        None
+    };
+
+    let r = if ctx_info.is_dlss {
+        if let Some(params) = &dlss_params {
+            if crate::dlss::dispatch_sr_and_capture(list, params, hudless) {
+                OK
+            } else {
+                ERROR
+            }
+        } else {
+            ERROR_PARAMETER
+        }
+    } else {
+        let Some(api) = api() else { return ERROR };
+        // SAFETY: the SDK's call on an open host list with live textures.
+        let r = unsafe { (api.dispatch)(context, (&raw const d).cast()) };
+        if r == OK
+            && crate::dlss::fg_enabled()
+            && let Some(params) = &dlss_params
+        {
+            crate::dlss::capture_fg_after_external_sr(list, params, hudless);
+        }
+        r
+    };
+
     if r == OK {
         if let Some(packed) = packed_output {
             packed.copy_to(list, output, destination);
@@ -489,7 +820,7 @@ pub extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *const Header) ->
     FIRST.call_once(|| {
         // SAFETY: the destination is a live host texture.
         let format = unsafe { destination.GetDesc() }.Format.0;
-        tracing::info!(render = ?d.render_size, upscale = ?d.upscale_size, result = r, ?input, ?output, format, packed = packed_output.is_some(), "ffx: first upscale recorded on the host GPU");
+        tracing::info!(render = ?d.render_size, upscale = ?d.upscale_size, result = r, ?input, ?output, format, packed = packed_output.is_some(), dlss = ctx_info.is_dlss, "ffx: first upscale recorded on the host GPU");
     });
     r
 }
@@ -543,5 +874,52 @@ mod tests {
         assert!(unsafe { upscale_in(chain) }.is_none());
         // SAFETY: an empty chain.
         assert!(unsafe { upscale_in(std::ptr::null()) }.is_none());
+    }
+
+    #[test]
+    fn standalone_dlss_queries_return_versions_and_jitter() {
+        let mut count = 1u64;
+        let mut id = 0u64;
+        let mut name: *const i8 = std::ptr::null();
+        let mut qv = GetVersions {
+            kind: QUERY_GET_VERSIONS,
+            next: std::ptr::null_mut(),
+            create_kind: CREATE_UPSCALE,
+            device: std::ptr::null_mut(),
+            count: &raw mut count,
+            ids: &raw mut id,
+            names: &raw mut name,
+        };
+        // SAFETY: local `GetVersions` struct lives for the call.
+        assert_eq!(
+            unsafe { answer_dlss_query(QUERY_GET_VERSIONS, (&raw mut qv).cast()) },
+            OK
+        );
+        assert_eq!(count, 1);
+        assert_eq!(id, DLSS_PROVIDER_ID);
+        assert!(!name.is_null());
+
+        #[repr(C)]
+        struct JitterPhase {
+            kind: u64,
+            next: *mut Header,
+            render_width: u32,
+            display_width: u32,
+            out: *mut i32,
+        }
+        let mut phases = 0i32;
+        let mut qp = JitterPhase {
+            kind: QUERY_JITTER_PHASE_COUNT,
+            next: std::ptr::null_mut(),
+            render_width: 2560,
+            display_width: 3840,
+            out: &raw mut phases,
+        };
+        // SAFETY: local `JitterPhase` struct lives for the call.
+        assert_eq!(
+            unsafe { answer_dlss_query(QUERY_JITTER_PHASE_COUNT, (&raw mut qp).cast()) },
+            OK
+        );
+        assert_eq!(phases, 18);
     }
 }
