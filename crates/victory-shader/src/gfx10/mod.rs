@@ -152,14 +152,16 @@ fn flow(inst: &Instruction, next: usize, len: usize) -> Result<Flow, ShaderError
 /// Resolves the far jump compilers emit beyond the reach of a branch offset:
 /// `s_getpc_b64 s[n:n+1]`, `s_add_u32|s_sub_u32 sn, sn, literal`, a carry
 /// into s(n+1), `s_setpc_b64 s[n:n+1]`, looking back over the straight-line
-/// run just decoded. Any other `s_setpc_b64` (e.g. a handover to the next
-/// merged stage through registers) gives `None`.
+/// run just decoded. Only NOPs and waits may separate those operations:
+/// another instruction may overwrite the pair or its carry. Any other
+/// `s_setpc_b64` (e.g. a handover to the next merged stage) gives `None`.
 fn far_jump<'a>(
     before: impl Fn(usize) -> Option<&'a Instruction>,
     setpc: &Instruction,
     len: usize,
 ) -> Result<Option<usize>, ShaderError> {
     let n = setpc.words[0] & 0xFF;
+    let mut carry = None;
     let mut delta = None;
     let mut at = setpc.offset;
     for _ in 0..4 {
@@ -172,24 +174,47 @@ fn far_jump<'a>(
         let w = prev.words[0];
         let (sdst, ssrc0, ssrc1) = ((w >> 16) & 0x7F, w & 0xFF, (w >> 8) & 0xFF);
         match (prev.encoding, prev.name()) {
+            (Encoding::Sop2, Some(op @ ("s_addc_u32" | "s_subb_u32")))
+                if sdst == n + 1 && ssrc0 == n + 1 && carry.is_none() && delta.is_none() =>
+            {
+                let high = match ssrc1 {
+                    128..=192 => ssrc1 - 128,
+                    193..=208 => (192i32 - ssrc1 as i32) as u32,
+                    0xFF => prev.words[1],
+                    _ => return Ok(None),
+                };
+                carry = Some((op, high));
+            }
             (Encoding::Sop2, Some(op @ ("s_add_u32" | "s_sub_u32")))
                 if sdst == n && ssrc0 == n && ssrc1 == 0xFF && delta.is_none() =>
             {
-                // The low dword of a signed 64-bit offset: a backward jump
-                // adds a negative one (its high dword is -1).
-                let literal = i64::from(prev.words[1] as i32);
+                let Some((high_op, high)) = carry else {
+                    return Ok(None);
+                };
+                if !matches!(
+                    (op, high_op),
+                    ("s_add_u32", "s_addc_u32") | ("s_sub_u32", "s_subb_u32")
+                ) {
+                    return Ok(None);
+                }
+                // Both words form the signed offset. In particular, a low
+                // word with bit 31 set is not negative when the high is 0.
+                // i128 also permits negating i64::MIN for subtraction.
+                let literal =
+                    i128::from(((u64::from(high) << 32) | u64::from(prev.words[1])) as i64);
                 delta = Some(if op == "s_add_u32" { literal } else { -literal });
             }
             (Encoding::Sop1, Some("s_getpc_b64")) if sdst == n => {
                 let Some(delta) = delta else { break };
                 // s_getpc_b64 yields the address of the instruction after it.
-                return usize::try_from(prev.offset as i64 + 4 + delta)
+                return usize::try_from(prev.offset as i128 + 4 + delta)
                     .ok()
                     .filter(|&t| t < len)
                     .map(Some)
                     .ok_or(isa(setpc.offset, "far jump target outside the code"));
             }
-            _ => {}
+            (Encoding::Sopp, Some("s_nop" | "s_waitcnt" | "s_waitcnt_depctr")) => {}
+            _ => return Ok(None),
         }
         at = prev.offset;
     }
@@ -473,6 +498,193 @@ mod tests {
                 (24, "s_setpc_b64"),
             ]
         );
+    }
+
+    #[test]
+    fn far_jumps_require_the_matching_high_word_operation() {
+        for high in [
+            0xBF80_0000, // s_nop: no high-word operation
+            0xBE88_0380, // s_mov_b32 s8, 0: overwrites the low word
+            0xBE89_0380, // s_mov_b32 s9, 0: overwrites the high word
+            0x8289_8009, // s_subb_u32 s9, s9, 0: wrong arithmetic
+            0x820A_8009, // s_addc_u32 s10, s9, 0: wrong destination
+            0x8209_8007, // s_addc_u32 s9, s7, 0: wrong source
+            0x8209_0A09, // s_addc_u32 s9, s9, s10: unknown high immediate
+        ] {
+            let code = [
+                0xBE88_1F00, // s_getpc_b64 s[8:9]
+                0x8008_FF08,
+                20, // s_add_u32 s8, s8, 20
+                high,
+                0xBE80_2008, // s_setpc_b64 s[8:9]
+                0xFFFF_FFFF, // data, not reached by a recognized far jump
+                S_ENDPGM,
+            ];
+            let found = summary(&code);
+            assert_eq!(found.last().unwrap().0, 16, "high word {high:#x}");
+            assert_eq!(found.last().unwrap().2, "s_setpc_b64");
+            let ir = crate::ir::build(&bytes(&code), false, 1).unwrap();
+            assert_eq!(ir.blocks[0].exit, crate::ir::Exit::Indirect);
+        }
+    }
+
+    #[test]
+    fn far_jumps_do_not_skip_register_or_carry_clobbers() {
+        for (at, clobber) in [
+            (1, 0xBE89_0380), // overwrite the high word before the add
+            (3, 0x800A_800A), // s_add_u32 s10, s10, 0 overwrites SCC
+            (4, 0xBE88_0380), // overwrite the low word after the carry
+            (4, 0xBE89_0380), // overwrite the high word after the carry
+        ] {
+            let mut code = vec![
+                0xBE88_1F00, // s_getpc_b64 s[8:9]
+                0x8008_FF08,
+                24,          // s_add_u32 s8, s8, 24 -> stale target 28
+                0x8209_8009, // s_addc_u32 s9, s9, 0
+                0xBE80_2008, // s_setpc_b64 s[8:9]
+                0xFFFF_FFFF,
+                S_ENDPGM,
+            ];
+            code.insert(at, clobber);
+            let found = summary(&code);
+            assert_eq!(found.last().unwrap().0, 20, "clobber {clobber:#x} at {at}");
+            assert_eq!(found.last().unwrap().2, "s_setpc_b64");
+            let ir = crate::ir::build(&bytes(&code), false, 1).unwrap();
+            assert_eq!(ir.blocks[0].exit, crate::ir::Exit::Indirect);
+        }
+    }
+
+    #[test]
+    fn far_jumps_use_both_halves_of_the_offset() {
+        for high in [0x8209_8109, 0x8209_C109] {
+            // A high word of 1 or -1 makes this a roughly +/-4 GiB offset,
+            // not the in-range +20 suggested by the low word alone.
+            let code = [
+                0xBE88_1F00,
+                0x8008_FF08,
+                20,
+                high,
+                0xBE80_2008,
+                0xFFFF_FFFF,
+                S_ENDPGM,
+            ];
+            assert!(matches!(
+                decode(&bytes(&code)),
+                Err(ShaderError::Isa {
+                    reason: "far jump target outside the code",
+                    ..
+                })
+            ));
+        }
+        // A low word with its sign bit set is positive when its high word
+        // is zero. It must not be mistaken for the -8 backward-jump form.
+        let code = [
+            sopp(0x02, 1),
+            S_ENDPGM,
+            0xBE88_1F00,
+            0x8008_FF08,
+            0xFFFF_FFF8,
+            0x8209_8009,
+            0xBE80_2008,
+        ];
+        assert!(matches!(
+            decode(&bytes(&code)),
+            Err(ShaderError::Isa {
+                reason: "far jump target outside the code",
+                ..
+            })
+        ));
+        // Subtracting the most negative signed 64-bit offset cannot fit
+        // this program either, but must not overflow the host arithmetic.
+        let code = [
+            0xBE88_1F00,
+            0x8088_FF08,
+            0,
+            0x8289_FF09,
+            0x8000_0000,
+            0xBE80_2008,
+        ];
+        assert!(matches!(
+            decode(&bytes(&code)),
+            Err(ShaderError::Isa {
+                reason: "far jump target outside the code",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn far_jump_arithmetic_keeps_forward_and_backward_add_and_subtract() {
+        for (low_op, low, high, target) in [
+            (0x8008_FF08, 20, 0x8209_8009, 32),          // add +20
+            (0x8008_FF08, 0xFFFF_FFF8, 0x8209_C109, 4),  // add -8
+            (0x8088_FF08, 0xFFFF_FFEC, 0x8289_C109, 32), // subtract -20
+            (0x8088_FF08, 8, 0x8289_8009, 4),            // subtract +8
+        ] {
+            let code = [
+                sopp(0x02, 1),
+                S_ENDPGM,
+                0xBE88_1F00,
+                low_op,
+                low,
+                high,
+                0xBE80_2008,
+                0xFFFF_FFFF,
+                S_ENDPGM,
+            ];
+            let ends: Vec<_> = summary(&code)
+                .into_iter()
+                .filter(|i| i.2 == "s_endpgm")
+                .map(|i| i.0)
+                .collect();
+            assert_eq!(ends, [target], "low {low:#x}, high {high:#x}");
+        }
+    }
+
+    #[test]
+    fn far_jumps_allow_literal_high_words_and_scheduling() {
+        let forward = [
+            0xBE88_1F00,
+            0x8008_FF08,
+            24,
+            0x8209_FF09,
+            0,
+            0xBE80_2008,
+            0xFFFF_FFFF,
+            S_ENDPGM,
+        ];
+        assert_eq!(summary(&forward).last().unwrap().0, 28);
+        let backward = [
+            sopp(0x02, 1),
+            S_ENDPGM,
+            0xBE88_1F00,
+            0x8008_FF08,
+            0xFFFF_FFF8,
+            0x8209_FF09,
+            0xFFFF_FFFF,
+            0xBE80_2008,
+        ];
+        assert!(summary(&backward).contains(&(4, 1, "s_endpgm")));
+
+        for wait in [0xBF80_0000, 0xBF8C_0000, 0xBFA3_FFFF] {
+            for at in [1, 3, 4] {
+                let mut code = vec![
+                    0xBE88_1F00,
+                    0x8008_FF08,
+                    24,
+                    0x8209_8009,
+                    0xBE80_2008,
+                    0xFFFF_FFFF,
+                    S_ENDPGM,
+                ];
+                code.insert(at, wait);
+                assert_eq!(
+                    summary(&code).last().unwrap().0,
+                    28,
+                    "wait {wait:#x} at {at}"
+                );
+            }
+        }
     }
 
     #[test]
