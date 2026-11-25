@@ -940,7 +940,6 @@ fn record_clamp_into(
     unsafe { dispatch_clamp(c, l, &constants, src_gpu, count_gpu, dst_gpu, budget) };
     true
 }
-
 /// The most records of one argument buffer gathered for a list
 /// ([`gather`]): a multiple of the clamp's 64 threads a group, so that the
 /// threads past the last record read inside the table.

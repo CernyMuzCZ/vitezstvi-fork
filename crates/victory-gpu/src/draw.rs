@@ -2576,7 +2576,6 @@ impl State {
             text
         });
     }
-
     /// Whether the shaders of the pipeline bound now can store to buffers
     /// (or the pipeline is not known): a draw with them may write the
     /// arguments of draws after it, which ends a list's gathering
