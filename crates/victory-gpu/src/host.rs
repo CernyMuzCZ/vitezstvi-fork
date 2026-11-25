@@ -77,6 +77,14 @@ static RETIRED: Mutex<Vec<(u64, Retired)>> = Mutex::new(Vec::new());
 static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Submissions started and finished so far ([`STARTED`], [`FINISHED`]): a
+/// heap map's pool slot given back while submission n may run is handed
+/// out again once n has finished (`descriptor::slot_map`), as [`retire`]
+/// drops objects.
+pub(crate) fn submissions() -> (u64, u64) {
+    (STARTED.load(Ordering::Acquire), FINISHED.load(Ordering::Acquire))
+}
+
 /// A retired object, dropped on whatever thread finishes the submission.
 struct Retired(#[allow(dead_code)] Box<dyn std::any::Any>);
 // SAFETY: what is retired is D3D12 objects (free-threaded) and the

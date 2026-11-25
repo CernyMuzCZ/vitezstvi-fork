@@ -12,6 +12,8 @@ use crate::resource::{Memory, PAGEABLE_IIDS};
 
 #[cfg(windows)]
 pub(crate) mod host;
+#[cfg(windows)]
+mod slot_map;
 
 const HEAP_IIDS: [Iid; 4] = [
     guid(
@@ -170,6 +172,29 @@ fn mirror(handle: u64) {
     }
 }
 
+/// The bytes of each heap page as [`sync_heaps`] last read them (#783).
+/// A page whose bytes are unchanged skips the walk over its 1,024-2,048
+/// records; a changed page hashes only records touched by the byte span
+/// that moved (plus any unmirrored slots with fingerprint 0).
+#[cfg(windows)]
+fn seen_pages() -> &'static std::sync::Mutex<std::collections::HashMap<usize, Vec<u8>>> {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<usize, Vec<u8>>>> =
+        std::sync::OnceLock::new();
+    SEEN.get_or_init(Default::default)
+}
+
+/// The first and last bytes that differ between two copies of a page, as a
+/// range whose end is exclusive: `None` when they are identical.
+#[cfg(windows)]
+fn page_diff(old: &[u8], now: &[u8]) -> Option<(usize, usize)> {
+    if old.len() != now.len() {
+        return Some((0, now.len()));
+    }
+    let first = old.iter().zip(now).position(|(a, b)| a != b)?;
+    let last = old.iter().zip(now).rposition(|(a, b)| a != b)?;
+    Some((first, last + 1))
+}
+
 /// Mirrors records copied directly into placed shader-visible heaps. Calls
 /// to `Create*View` are already mirrored by [`mirror`]; raw CPU copies leave
 /// only write-watch pages to reveal which slots changed.
@@ -200,9 +225,9 @@ pub(crate) fn sync_heaps() {
             continue;
         };
         let step = u64::from(step);
-        // Capped host heaps have no counterparts for the title slots reserved
-        // for per-draw tables; raw writes there must not be mirrored.
-        let mirrored_count = heap.desc.count.min(host.count());
+        // Capped host heaps without a heap map have no counterparts for
+        // slots past the cap; with a heap map every title slot is mirrored.
+        let mirrored_count = heap.desc.count.min(host.mirrored_count());
         for (range_from, range_end) in written.take(start as usize, end as usize) {
             let mut page = range_from & !(crate::watch::PAGE - 1);
             while page < range_end {
@@ -214,12 +239,35 @@ pub(crate) fn sync_heaps() {
                 page_bytes.resize(to - from, 0);
                 if crate::host::read_into(from as *const u8, &mut page_bytes) {
                     pages += 1;
+                    // Skip pages rewritten with identical bytes, and bound
+                    // the changed span on modified pages (#783).
+                    let moved = {
+                        let mut seen = seen_pages().lock().unwrap_or_else(|e| e.into_inner());
+                        let held = seen.remove(&from);
+                        let moved = match &held {
+                            Some(old) if old.as_slice() == page_bytes.as_slice() => {
+                                seen.insert(from, held.unwrap_or_default());
+                                page += crate::watch::PAGE;
+                                continue;
+                            }
+                            Some(old) => page_diff(old, &page_bytes),
+                            None => None,
+                        };
+                        if seen.len() >= 4096 {
+                            seen.clear();
+                        }
+                        let mut store = held.unwrap_or_default();
+                        store.clear();
+                        store.extend_from_slice(&page_bytes);
+                        seen.insert(from, store);
+                        moved
+                    };
                     let slots = changed_slots(from, to, start as usize, step, mirrored_count);
                     // The page's records in one go, under one lock
                     // (`HostHeap::mirror_copied_page`); one by one below
                     // with `VICTORY_HEAP_SYNC_PAGE=0`.
                     let slots = if page_at_once() {
-                        let (seen, made) = host.mirror_copied_page(slots, (start, step), from, &page_bytes);
+                        let (seen, made) = host.mirror_copied_page(slots, (start, step), from, &page_bytes, moved);
                         looked += seen;
                         mirrored += made;
                         0..0
@@ -323,8 +371,24 @@ pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
 impl Drop for Heap {
     fn drop(&mut self) {
         let at = std::ptr::from_ref::<Heap>(self) as usize;
-        let mut heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
-        heaps.retain(|&(_, _, h)| h != at);
+        let mut range = None;
+        {
+            let mut heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
+            heaps.retain(|&(start, end, h)| {
+                if h == at {
+                    range = Some((start as usize, end as usize));
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        if let Some((start, end)) = range {
+            seen_pages()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|&page, _| !(start..end).contains(&page));
+        }
     }
 }
 

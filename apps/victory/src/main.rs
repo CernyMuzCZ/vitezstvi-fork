@@ -165,6 +165,13 @@ fn main() -> Result<()> {
             if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT").ok().and_then(|v| v.parse().ok()) {
                 victory_shader::emit::set_view_heap_limit(n);
             }
+            // `VICTORY_VIEW_MAP=<window>:<slot>`: translate as on a capped host with a heap map
+            if let Some((w, s)) = std::env::var("VICTORY_VIEW_MAP").ok().and_then(|v| {
+                let (w, s) = v.trim().split_once(':')?;
+                Some((w.trim().parse::<u32>().ok()?, s.trim().parse::<u32>().ok()?))
+            }) {
+                victory_shader::emit::set_view_heap_map(Some((w, s)));
+            }
             // `VICTORY_HOST_WAVE=32`: translate as for a GPU whose waves are at most 32 lanes
             if let Some(n) = std::env::var("VICTORY_HOST_WAVE").ok().and_then(|v| v.parse().ok()) {
                 victory_shader::emit::set_host_max_wave(n);

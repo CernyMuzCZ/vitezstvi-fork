@@ -141,7 +141,8 @@ pub use shader::{
     LOOP_NOTE_DWORDS, LOOP_NOTES, MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE,
     SLOT_FAULTS, SLOT_LOOPS, SLOT_MEMORY, SLOT_STRIDES, SLOT_STRIDES_COUNT, SLOT_VIEW_ADDRESSES,
     USER_DATA_SPACE, USER_GROUP_BASE, USER_MEMORY_BASE, USER_STRUCTURES, USER_THREAD_LIMIT,
-    USER_VIEW_ADDRESS, USER_VIEW_BIAS, set_view_heap_limit, view_heap_limit,
+    USER_VIEW_ADDRESS, USER_VIEW_BIAS, set_view_heap_limit, set_view_heap_map, view_heap_limit,
+    view_heap_map,
 };
 
 /// The iteration counts after which a translated loop whose end the data
@@ -281,6 +282,10 @@ pub fn translation_fingerprint() -> Vec<u8> {
     }
     out.extend_from_slice(&lower::host_max_wave().to_le_bytes());
     out.extend_from_slice(&shader::view_heap_limit().to_le_bytes());
+    let map = shader::view_heap_map().map_or([u32::MAX; 2], |(w, s)| [w, s]);
+    for word in map {
+        out.extend_from_slice(&word.to_le_bytes());
+    }
     let limits = loop_limits();
     for limit in [limits.pixel, limits.vertex, limits.compute, limits.trace] {
         out.extend_from_slice(&limit.to_le_bytes());
