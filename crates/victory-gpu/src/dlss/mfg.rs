@@ -7,6 +7,7 @@
 //! `eRetainResourcesWhenOff`) on non-gameplay frames (boot/menus/loading) and
 //! before `ResizeBuffers`.
 
+use std::collections::VecDeque;
 use std::sync::Mutex;
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -261,13 +262,67 @@ struct SnapshotTex {
 // SAFETY: D3D12 resources are free-threaded COM objects.
 unsafe impl Send for SnapshotTex {}
 
+#[derive(Clone)]
 struct PendingFrameInputs {
-    token_addr: usize,
+    consts: Constants,
     render_size: [u32; 2],
     upscale_size: [u32; 2],
     mv_display_res: bool,
     dynamic_res: bool,
     hudless_format: Option<DXGI_FORMAT>,
+}
+
+// SAFETY: `Constants::base.next` is always null in our constructed structs and
+// every other field is a plain value (`f32`/`u32`/`u8`).
+unsafe impl Send for PendingFrameInputs {}
+
+/// Consecutive `Present`s without a new `ffxDispatch` before DLSS-G auto-pauses
+/// (tolerates async recording/submission pipelining across frame token advances
+/// while still pausing promptly on menus/loading screens).
+const PAUSE_AFTER_MISSED_PRESENTS: u32 = 3;
+const MAX_PENDING_QUEUE: usize = 4;
+
+struct DispatchTracker {
+    queue: VecDeque<PendingFrameInputs>,
+    last_valid: Option<PendingFrameInputs>,
+    missed_presents: u32,
+}
+
+impl DispatchTracker {
+    fn new() -> Self {
+        Self {
+            queue: VecDeque::with_capacity(MAX_PENDING_QUEUE),
+            last_valid: None,
+            missed_presents: PAUSE_AFTER_MISSED_PRESENTS,
+        }
+    }
+
+    fn push(&mut self, inputs: PendingFrameInputs) {
+        if self.queue.len() >= MAX_PENDING_QUEUE {
+            self.queue.pop_front();
+        }
+        self.queue.push_back(inputs);
+    }
+
+    fn clear(&mut self) {
+        self.queue.clear();
+        self.last_valid = None;
+        self.missed_presents = PAUSE_AFTER_MISSED_PRESENTS;
+    }
+
+    fn take_for_present(&mut self) -> Option<&PendingFrameInputs> {
+        if let Some(next) = self.queue.pop_front() {
+            self.missed_presents = 0;
+            self.last_valid = Some(next);
+        } else {
+            self.missed_presents = self.missed_presents.saturating_add(1);
+        }
+        if self.missed_presents < PAUSE_AFTER_MISSED_PRESENTS {
+            self.last_valid.as_ref()
+        } else {
+            None
+        }
+    }
 }
 
 struct MfgManager {
@@ -276,7 +331,7 @@ struct MfgManager {
     depth_snap: Option<SnapshotTex>,
     mvec_snap: Option<SnapshotTex>,
     hudless_snap: Option<SnapshotTex>,
-    pending: Option<PendingFrameInputs>,
+    dispatches: DispatchTracker,
     logged_first_active: bool,
     logged_first_interpolated: bool,
     logged_hudless_decision: bool,
@@ -295,7 +350,7 @@ fn with_mfg<R>(f: impl FnOnce(&mut MfgManager) -> R) -> R {
             depth_snap: None,
             mvec_snap: None,
             hudless_snap: None,
-            pending: None,
+            dispatches: DispatchTracker::new(),
             logged_first_active: false,
             logged_first_interpolated: false,
             logged_hudless_decision: false,
@@ -374,7 +429,7 @@ pub fn on_before_resize(rt: &StreamlineRuntime) {
     }
     let token = rt.ensure_frame_token();
     with_mfg(|mgr| {
-        mgr.pending = None;
+        mgr.dispatches.clear();
         if mgr.machine.tags_non_null
             && let Some(tok) = token
         {
@@ -517,7 +572,7 @@ fn copy_into_snapshot(
 pub(crate) fn record_dispatch_snapshots(
     rt: &StreamlineRuntime,
     list: &HostList,
-    token: *const FrameToken,
+    consts: Constants,
     depth: &ID3D12Resource,
     mvec: &ID3D12Resource,
     hudless: Option<(&ID3D12Resource, D3D12_RESOURCE_STATES)>,
@@ -570,8 +625,8 @@ pub(crate) fn record_dispatch_snapshots(
             }
         }
 
-        mgr.pending = Some(PendingFrameInputs {
-            token_addr: token as usize,
+        mgr.dispatches.push(PendingFrameInputs {
+            consts,
             render_size,
             upscale_size,
             mv_display_res: create_flags & super::sr::FFX_FLAG_DISPLAY_RES_MV != 0,
@@ -596,23 +651,25 @@ pub fn on_before_present(
     let cfg = config();
 
     with_mfg(|mgr| {
-        let pending = mgr.pending.take();
-        let has_matching_inputs = pending
-            .as_ref()
-            .is_some_and(|p| p.token_addr == token as usize)
+        let active_inputs = mgr.dispatches.take_for_present().cloned();
+        let has_matching_inputs = active_inputs.is_some()
             && mgr.depth_snap.is_some()
             && mgr.mvec_snap.is_some();
 
         let swap_ok = is_supported_swapchain_format(format);
-        let dynamic_res = pending.as_ref().is_some_and(|p| p.dynamic_res);
+        let dynamic_res = active_inputs.as_ref().is_some_and(|p| p.dynamic_res);
         let (decision, changed) =
             mgr.machine
                 .decide_for_present(has_matching_inputs, width, height, swap_ok, dynamic_res);
 
         if decision.tag_inputs
             && let (Some(p), Some(depth_snap), Some(mvec_snap)) =
-                (&pending, &mgr.depth_snap, &mgr.mvec_snap)
+                (&active_inputs, &mgr.depth_snap, &mgr.mvec_snap)
         {
+            // Ensure Streamline has `sl::Constants` bound to THIS exact `FrameToken`
+            // even when `ffxDispatch` was recorded on a worker thread before the
+            // previous frame's `advance_frame_token()`.
+            rt.set_constants_once(token, &p.consts);
             let state_srv = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE.0 as u32;
             let render_ext = Extent {
                 top: 0,
@@ -963,5 +1020,32 @@ mod tests {
         );
         assert_eq!(fmt3, DXGI_FORMAT_R16G16_FLOAT);
         assert_eq!(flags3, D3D12_RESOURCE_FLAG_NONE);
+    }
+
+    #[test]
+    fn pipelined_dispatch_queue_survives_token_advance_and_pauses_after_misses() {
+        let sample = |w: u32| PendingFrameInputs {
+            consts: Constants::default(),
+            render_size: [w, 1440],
+            upscale_size: [3840, 2160],
+            mv_display_res: false,
+            dynamic_res: false,
+            hudless_format: None,
+        };
+        let mut tracker = DispatchTracker::new();
+        // Before any gameplay dispatch -> no inputs (paused on boot/menus).
+        assert!(tracker.take_for_present().is_none());
+
+        // Pipelined recording: two dispatches queued before Present pops them in FIFO order.
+        tracker.push(sample(2560));
+        tracker.push(sample(2400));
+        assert_eq!(tracker.take_for_present().map(|p| p.render_size[0]), Some(2560));
+        assert_eq!(tracker.take_for_present().map(|p| p.render_size[0]), Some(2400));
+
+        // 1-2 frame hiccup without a new dispatch stays active via grace window.
+        assert_eq!(tracker.take_for_present().map(|p| p.render_size[0]), Some(2400));
+        assert_eq!(tracker.take_for_present().map(|p| p.render_size[0]), Some(2400));
+        // 3rd consecutive miss (real menu/loading screen) -> auto-pauses.
+        assert!(tracker.take_for_present().is_none());
     }
 }

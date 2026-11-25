@@ -124,13 +124,13 @@ pub(crate) fn dispatch_sr_and_capture(
     hudless: Option<(&ID3D12Resource, D3D12_RESOURCE_STATES)>,
 ) -> bool {
     let Some(rt) = streamline::runtime() else { return false };
-    let Some((token, _consts)) = sr::evaluate(rt, &list.list, params) else {
+    let Some((_token, consts)) = sr::evaluate(rt, &list.list, params) else {
         return false;
     };
     mfg::record_dispatch_snapshots(
         rt,
         list,
-        token,
+        consts,
         params.depth,
         params.mvec,
         hudless,
@@ -169,7 +169,7 @@ pub(crate) fn capture_fg_after_external_sr(
     mfg::record_dispatch_snapshots(
         rt,
         list,
-        token,
+        consts,
         params.depth,
         params.mvec,
         hudless,
