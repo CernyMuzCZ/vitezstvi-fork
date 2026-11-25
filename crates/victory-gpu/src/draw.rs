@@ -336,7 +336,7 @@ fn jump_windows() -> bool {
 /// such records, in place of a pass of ours in front of its draw
 /// (`crate::indirect::gather`; `VICTORY_INDIRECT_GATHER=1`; `alt`: twenty
 /// seconds with, twenty without, in turn, each change said in the log).
-/// Off by default. Needs [`windows`].
+/// Off by default. Works with [`windows`] or standalone.
 fn gathers() -> bool {
     /// 0 off, 1 on, 2 in turn.
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
@@ -3757,18 +3757,18 @@ impl State {
         // or may write the arguments.
         const WINDOW_USE: usize = usize::MAX - 0x77;
         let offset = args.offset(arguments);
-        let windowed = windows()
-            && kind != DISPATCH
+        let eligible = kind != DISPATCH
             && max == 1
             && count.is_none()
             && !p.stages.iter().any(|stage| stage.translated().stores);
+        let windowed = windows() && eligible;
         // Another host list (a new one after a cut, or this one after its
         // reset) has another scratch buffer, or this one's with old bytes.
         let first_on_list = list.first_use(WINDOW_USE);
         if !windowed || first_on_list {
             self.window = None;
         }
-        if !windowed {
+        if !eligible {
             // A dispatch, or shaders that store to buffers: arguments may
             // be written from here on.
             list.gather_close();
@@ -3807,7 +3807,7 @@ impl State {
         // list wrote before this draw (a copy into the argument buffer) is
         // not as the prelude would read it: the list stops gathering, and
         // this record and those after it are clamped in the list.
-        let gathered = if hit.is_none() && windowed && gathers() {
+        let gathered = if hit.is_none() && eligible && gathers() {
             if list.writes_declared((arguments as usize, (arguments + len) as usize)) {
                 list.gather_close();
             }
