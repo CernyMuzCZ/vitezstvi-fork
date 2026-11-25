@@ -385,9 +385,11 @@ struct AudioLogVoice {
 // t: Unix epoch milliseconds (UTC); rd/wr: output ring blocks.
 // sub counts input submissions (XMA enables), not read-advance commands.
 // bytes/hash describe the selected compressed input at submission; hash=0 if unavailable.
-// produced/taken are cumulative for the current enable. All ACP completions are immediate.
+// pending: valid compressed input bytes remaining (partial bytes rounded up);
+// queue: number of valid input buffers, not ACP commands or decoded PCM.
+// These are context snapshots, not playback counters. ACP completions are immediate.
 // Non-XMA commands use the ACP handle as voice and their known command payload.
-fn trace_audio(event: &str, key: usize, context: Option<Context>, voice: Option<&Voice>,
+fn trace_audio(event: &str, key: usize, context: Option<Context>,
     input: Option<(usize, u64)>, command: u32) {
     static START: OnceLock<Instant> = OnceLock::new();
     static LOG: Mutex<(BTreeMap<usize, AudioLogVoice>, u64, u128)> =
@@ -414,9 +416,18 @@ fn trace_audio(event: &str, key: usize, context: Option<Context>, voice: Option<
     v.recent.push_back(t);
     let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default().as_millis();
-    let (produced, taken) = voice.map_or((0, 0), |v| (v.trace.produced, v.trace.taken));
+    let (pending, queue) = context.map_or((0, 0), |c| {
+        let valid = c.field(0, 20, 2);
+        let current = c.field(4, 31, 1) as usize;
+        let read_bits = c.field(2, 0, 26) as usize;
+        let pending = (0..2).filter(|i| valid & (1 << i) != 0).map(|i| {
+            let bits = c.field(i, 0, 12) as usize * xma::PACKET_BYTES * 8;
+            bits.saturating_sub(if i == current { read_bits } else { 0 }).div_ceil(8)
+        }).sum::<usize>();
+        (pending, valid.count_ones())
+    });
     let (rd, wr) = context.map_or((0, 0), |c| (c.field(9, 0, 5), c.field(0, 27, 5)));
-    tracing::info!("audio: t={t} event={event} voice={key} sub={} bytes={} produced={produced} taken={taken} rd={rd} wr={wr} hash={:016x} done=immediate cmd={command}", v.sub, v.bytes, v.hash);
+    tracing::info!("audio: t={t} event={event} voice={key} sub={} bytes={} pending={pending} queue={queue} rd={rd} wr={wr} hash={:016x} done=immediate cmd={command}", v.sub, v.bytes, v.hash);
 }
 
 fn audio_hash(data: &[u8]) -> u64 {
@@ -434,8 +445,7 @@ fn trace_audio_command(this: *mut Acp, command: u32, word: impl Fn(usize) -> Opt
     };
     for index in indices {
         let context = x.context(index);
-        let slot = x.voices.get(index as usize).map(lock);
-        let voice = slot.as_deref().and_then(Option::as_ref);
+        let _slot = x.voices.get(index as usize).map(lock);
         let input = if event == "submit" && matches!(command, ENABLE_XMA | ENABLE_XMAS) {
             context.map(|c| {
                 let current = c.field(4, 31, 1) as usize;
@@ -460,7 +470,7 @@ fn trace_audio_command(this: *mut Acp, command: u32, word: impl Fn(usize) -> Opt
             Some((bytes, audio_hash(&data)))
         } else { None };
         let key = if index == u32::MAX { this as usize } else { index as usize };
-        trace_audio(event, key, context, voice, input, command);
+        trace_audio(event, key, context, input, command);
     }
 }
 
@@ -597,7 +607,7 @@ impl Xma {
             {
                 pump(context, voice);
                 if trace_audio_enabled() {
-                    trace_audio("process", index as usize, Some(context), Some(voice), None, 0);
+                    trace_audio("process", index as usize, Some(context), None, 0);
                 }
                 active += 1;
             }
