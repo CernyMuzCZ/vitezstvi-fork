@@ -3468,6 +3468,9 @@ impl State {
         first: u32,
         first_instance: u32,
     ) {
+        if vertices == 0 || instances == 0 {
+            return;
+        }
         self.window = None;
         if self.may_store() {
             list.gather_close();
@@ -3576,6 +3579,9 @@ impl State {
         base: i32,
         first_instance: u32,
     ) {
+        if indices == 0 || instances == 0 {
+            return;
+        }
         self.window = None;
         if self.may_store() {
             list.gather_close();
