@@ -1716,13 +1716,15 @@ mod tests {
     fn fragmented_streams_match_original_decoder() {
         let t = Tables::builtin().unwrap();
         let controls: Vec<_> = (0..t.ctrl7.len()).filter(|&i| t.ctrl7[i] != 0).collect();
+        // FNV-1a hashes of the unoptimized c3b3e37 decoder (BC7 uses our aligned
+        // dictionary parser verified by `bc7_dictionary_indices_line_up`).
         let goldens = [
             (1, 0x902f48706898a802),
             (3, 0xa00c319565a4e855),
             (4, 0xcf17a5467f7386bb),
             (5, 0x454337d8bb02bbbe),
             (6, 0x2f974d9b46528ac9),
-            (7, 0xe74844da352c26a4),
+            (7, 0x9ad4c825f4f44acc),
         ];
         for ((widths, per), (bc, expected)) in LAYOUTS.into_iter().zip(goldens) {
             let mut records = random_records(widths, per, 600, false);
@@ -1745,6 +1747,15 @@ mod tests {
             let block_size = if matches!(bc, 1 | 4) { 8 } else { 16 };
             let mut dst = vec![0; records.len() * block_size];
             decode(bc, &src, &mut dst, &t).unwrap();
+            if bc == 7 {
+                let mut reference = vec![0u8; dst.len()];
+                bc7_reference(
+                    records.iter().map(Vec::as_slice),
+                    reference.chunks_exact_mut(16),
+                    &t,
+                );
+                assert_eq!(dst, reference, "BC7 fast path diverged from reference");
+            }
             // FNV-1a of the original decoder's complete output.
             let hash = dst.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| {
                 (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
@@ -1756,6 +1767,131 @@ mod tests {
                 Err(Error("the stream ends early or is corrupt"))
             );
             assert!(dst.iter().all(|&b| b == 0xcd));
+        }
+    }
+
+    /// Pre-optimization BC7 block decoder and packer (from c3b3e37), used to
+    /// prove the fast path produces bit-identical output with aligned tables.
+    fn bc7_reference<'a>(
+        records: impl Iterator<Item = &'a [u8]>,
+        out: impl Iterator<Item = &'a mut [u8]>,
+        t: &Tables,
+    ) {
+        let mut history = vec![(Bc7Ep::default(), Bc7Ix::default()); HISTORY];
+        let zero = (Bc7Ep::default(), Bc7Ix::default());
+        for (i, (s, block)) in records.zip(out).enumerate() {
+            let (ep_ref, ix_ref) = references(s, true);
+            let ctrl = t.ctrl7[usize::from(s[31] & 15) << 5 | usize::from(s[30] & 31)];
+            let mode = usize::from(ctrl & 7);
+            let subsets = usize::from((ctrl & 0xff) >> 6);
+            let prec = bc7_precision(ctrl);
+            let three = subsets == 3;
+            let or0 = |v: u8| if three { 0 } else { v };
+            let if3 = |v: u8| if three { v } else { 0 };
+            let stored = [
+                [s[4], s[5], s[6], s[7], s[8], s[9], or0(s[10]), or0(s[11])],
+                [s[12], s[13], s[14], s[15], s[16], s[17], or0(s[18]), or0(s[19])],
+                [s[20], s[21], if3(s[10]), if3(s[11]), if3(s[18]), if3(s[19]), 0, 0],
+            ];
+            let r = &pick(i, ep_ref, &history, &t.bc7, &zero).0;
+            let mut ep = Bc7Ep { ctrl, ..Default::default() };
+            let common = subsets.min(usize::from((r.ctrl & 0xff) >> 6));
+            let columns = if prec[3] > 0 { 8 } else { 6 };
+            for c in 0..columns {
+                let p = prec[c / 2];
+                if p == 0 {
+                    continue;
+                }
+                let mask = 0xffffu16 << (16 - p);
+                for (row, st) in stored.iter().enumerate().take(subsets) {
+                    let v = st[c];
+                    let residual =
+                        (u16::from(v >> 1) ^ (v & 1).wrapping_neg() as i8 as u16) << (16 - p);
+                    let base = r.rows[if row < common { row } else { 0 }][c] & mask;
+                    ep.rows[row][c] = base.wrapping_add(residual);
+                }
+            }
+            let bits = BC7_INDEX[mode];
+            let rx = &pick(i, ix_ref, &history, &t.bc7, &zero).1;
+            let mut ix = Bc7Ix { bits, ..Default::default() };
+            for (set, offsets) in [[22, 24, 26, 28], [12, 14, 16, 20]].into_iter().enumerate() {
+                if bits[set] == 0 {
+                    continue;
+                }
+                for (k, o) in offsets.into_iter().enumerate() {
+                    for (b, &byte) in s[o..o + 2].iter().enumerate() {
+                        let half = |v: u8| (0..4).fold(0u8, |acc, j| acc | (v >> (2 * j) & 1) << j);
+                        let z = |u: u8| i16::from(u >> 1) ^ -i16::from(u & 1);
+                        let (even, odd) = (z(half(byte)), z(half(byte >> 1)));
+                        let pair = if k < 3 { [odd, even] } else { [even, odd] };
+                        for (h, &v) in pair.iter().enumerate() {
+                            let p = 4 * k + 2 * b + h;
+                            ix.ix[set][p] = add_index(v, bits[set], rx.ix[set][p], rx.bits[set]);
+                        }
+                    }
+                }
+            }
+            history[i % HISTORY] = (ep, ix);
+            let part = usize::from(ctrl >> 8 & 63);
+            let rot = usize::from(ctrl >> 3 & 3);
+            let mut w = Bits::default();
+            let mode_u16 = ctrl & 7;
+            w.put(1 << mode_u16, u32::from(mode_u16) + 1);
+            match mode_u16 {
+                0 => w.put(part as u64, 4),
+                1 | 2 | 3 | 7 => w.put(part as u64, 6),
+                4 => {
+                    w.put(rot as u64, 2);
+                    w.put(u64::from(ctrl >> 5 & 1), 1);
+                }
+                5 => w.put(rot as u64, 2),
+                _ => {}
+            }
+            let ends = 2 * subsets;
+            let field = |row: usize, col: usize, p: u8| u64::from(ep.rows[row][col] >> (16 - p));
+            let mut order = [0, 1, 2, 3];
+            if rot != 0 {
+                order.swap(3, rot - 1);
+            }
+            for ch in order {
+                let p = prec[ch];
+                if p == 0 {
+                    continue;
+                }
+                let drop = u32::from(ch == 0 && pbits(mode_u16));
+                for e in 0..ends {
+                    w.put(field(e / 2, 2 * ch + e % 2, p) >> drop, u32::from(p) - drop);
+                }
+            }
+            match mode_u16 {
+                1 => (0..subsets).for_each(|row| w.put(field(row, 0, prec[0]) & 1, 1)),
+                m if pbits(m) => (0..ends).for_each(|e| w.put(field(e / 2, e % 2, prec[0]) & 1, 1)),
+                _ => {}
+            }
+            let anchors: &[u8] = match subsets {
+                2 => &[0, ANCHOR2[part]],
+                3 => &[0, ANCHOR3A[part], ANCHOR3B[part]],
+                _ => &[0],
+            };
+            let mut indices = |set: usize| {
+                let bits = ix.bits[set];
+                for (p, &v) in ix.ix[set].iter().enumerate() {
+                    let n = u32::from(bits) - u32::from(anchors.contains(&(p as u8)));
+                    w.put(u64::from(v as u16), n);
+                }
+            };
+            match mode_u16 {
+                4 => {
+                    indices(1);
+                    indices(0);
+                }
+                5 => {
+                    indices(0);
+                    indices(1);
+                }
+                _ => indices(0),
+            }
+            block.copy_from_slice(&w.v.to_le_bytes());
         }
     }
 
