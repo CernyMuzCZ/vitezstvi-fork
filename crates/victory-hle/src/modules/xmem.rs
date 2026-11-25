@@ -797,6 +797,11 @@ static PHYSICAL: LazyLock<Mutex<Physical>> = LazyLock::new(|| {
     })
 });
 
+/// Lock order: whenever both `victory_gpu`'s title-memory mapping RwLock
+/// (`title_memory_remapping` / `title_memory_reading`) and [`PHYSICAL`] are
+/// held together, the mapping lock is ALWAYS taken first, then [`PHYSICAL`].
+/// Taking [`PHYSICAL`] before `title_memory_remapping` deadlocks against
+/// `texture.rs` (`title_memory_reading` -> `va_generation_digest` -> `physical`).
 fn physical() -> MutexGuard<'static, Physical> {
     PHYSICAL.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -1321,12 +1326,14 @@ pub extern "system" fn XMemMapPhysicalPages(
     pages: *const usize,
 ) -> *mut c_void {
     let base = address as usize;
-    let mut physical = physical();
     // Until the pages are mapped again: `unmap` takes whole views away and
     // maps what stays of them again, and a mapped view is a reservation
     // until it is committed. A read of title memory in place must not fall
-    // into that gap (`victory_gpu::title_memory_remapping`).
+    // into that gap (`victory_gpu::title_memory_remapping`). Taken BEFORE
+    // `physical()` so we match `texture.rs`'s `title_memory_reading` ->
+    // `va_generation_digest` -> `physical()` lock order.
     let _changing = victory_gpu::title_memory_remapping();
+    let mut physical = physical();
     unmap(&mut physical, base, n * PAGE);
     if pages.is_null() {
         return address;
@@ -1393,9 +1400,10 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 /// heap. False if a source page is not mapped physical memory.
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
-    let mut physical = physical();
-    // As in `XMemMapPhysicalPages`: no read in place meets the gap.
+    // As in `XMemMapPhysicalPages`: taken BEFORE `physical()` to avoid an
+    // AB-BA deadlock with `title_memory_reading` -> `va_generation_digest`.
     let _changing = victory_gpu::title_memory_remapping();
+    let mut physical = physical();
     unmap(&mut physical, to, len);
     if from != 0
         && len > PAGE
@@ -2530,7 +2538,9 @@ mod tests {
     #[test]
     fn va_generation_digest_tracks_mapped_views_and_rejects_gaps() {
         let pages = allocate(2);
-        let va = XMemVirtualAlloc(std::ptr::null_mut(), 2 * PAGE, MEM_RESERVE | PAGES_64K, 0, 0x04);
+        // Reserve 3 pages and map only 2 so the 3rd page is guaranteed unmapped
+        // even when other xmem tests allocate adjacent VA concurrently.
+        let va = XMemVirtualAlloc(std::ptr::null_mut(), 3 * PAGE, MEM_RESERVE | PAGES_64K, 0, 0x04);
         assert!(!va.is_null());
         assert_eq!(XMemMapPhysicalPages(va, 2, pages.as_ptr()), va);
         let addr = va as usize;
@@ -2549,5 +2559,40 @@ mod tests {
         assert!(va_generation_digest(addr, 2 * PAGE).is_none());
         assert_ne!(unsafe { VirtualFree(va, 0, 0x8000) }, 0);
         assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+    }
+
+    /// Regression test for the AB-BA deadlock between `texture.rs`
+    /// (`title_memory_reading` -> `va_generation_digest` -> `physical()`)
+    /// and `XMemMapPhysicalPages` / `map_alias` (which previously took
+    /// `physical()` before `title_memory_remapping()`).
+    #[test]
+    fn va_generation_digest_does_not_deadlock_with_remapping() {
+        let pages = allocate(1);
+        let src = XMemVirtualAlloc(std::ptr::null_mut(), PAGE, MEM_RESERVE | PAGES_64K, 0, 0x04);
+        let dst = XMemVirtualAlloc(std::ptr::null_mut(), PAGE, MEM_RESERVE | PAGES_64K, 0, 0x04);
+        assert!(!src.is_null() && !dst.is_null());
+        assert_eq!(XMemMapPhysicalPages(src, 1, pages.as_ptr()), src);
+        let src_addr = src as usize;
+        let dst_addr = dst as usize;
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_r = stop.clone();
+        let reader = std::thread::spawn(move || {
+            while !stop_r.load(std::sync::atomic::Ordering::Relaxed) {
+                let _r = victory_gpu::title_memory_reading();
+                let _ = va_generation_digest(src_addr, PAGE);
+            }
+        });
+        for _ in 0..400 {
+            assert!(map_alias(dst_addr as u64, src_addr as u64, PAGE as u64));
+            assert!(map_alias(dst_addr as u64, 0, PAGE as u64));
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        reader.join().expect("reader thread joined without deadlock");
+
+        assert_eq!(XMemMapPhysicalPages(src, 1, std::ptr::null()), src);
+        assert_ne!(unsafe { VirtualFree(src, 0, 0x8000) }, 0);
+        assert_ne!(unsafe { VirtualFree(dst, 0, 0x8000) }, 0);
+        assert_eq!(XMemFreePhysicalPages(1, pages.as_ptr()), 1);
     }
 }
