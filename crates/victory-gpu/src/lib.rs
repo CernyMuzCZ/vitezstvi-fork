@@ -32,6 +32,8 @@ pub mod descriptor;
 pub mod device;
 pub mod display;
 #[cfg(windows)]
+pub mod dlss;
+#[cfg(windows)]
 mod drvwatch;
 #[cfg(windows)]
 mod fpsbox;
