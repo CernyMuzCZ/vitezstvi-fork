@@ -2471,9 +2471,10 @@ mod tests {
 
     /// `PS_VoxelizeVisiblity`'s parking (0xa18-0xa38, 0xe44-0xe4c, 0x2df8, 0x3184): a lane
     /// mask parked in lanes 3 and 4 of v56 and taken back to make EXEC, later a single scalar
-    /// parked in lane 3. Built as it is, the mask comes back as two scalars, which the
-    /// structurisation cannot see into; with [`with_shared_slots`] it comes back as the pair
-    /// it is, and EXEC as the compare's lanes.
+    /// parked in lane 3. With [`with_shared_slots`] the mask comes back as the pair it is, and
+    /// EXEC as the compare's lanes. Built as it is, the save of the pair and the restores that
+    /// read exactly that save are a pair too since the parked lane-mask change (#11,
+    /// `site_pairs`): the mask is no longer two scalars the structurisation cannot see into.
     #[test]
     fn a_mask_parked_in_lanes_another_scalar_shares_comes_back_whole_with_shared_slots() {
         let writelane = |lane: u32, s: u32| [0xD761_0038, s | (128 + lane) << 9]; // v_writelane_b32 v56, s, lane
@@ -2503,7 +2504,7 @@ mod tests {
             i.name()
         };
         let alone = build(&code, true, 64).unwrap();
-        assert_eq!(at(&alone), "s_mov_b32");
+        assert_eq!(at(&alone), "s_mov_b64");
         let shared = with_shared_slots(|| build(&code, true, 64)).unwrap();
         assert_eq!(at(&shared), "s_mov_b64");
         let opaque = |p: &Program| {
@@ -2513,7 +2514,7 @@ mod tests {
             let guard = st.guards[b][i].expect("a guard");
             st.bools.support(guard).iter().any(|a| matches!(a, crate::structure::Atom::Opaque(_)))
         };
-        assert!(opaque(&alone), "two scalars make an opaque mask");
+        assert!(!opaque(&alone), "the save's own restores make the pair (#11)");
         assert!(!opaque(&shared), "the pair is the compare's mask");
     }
 }
