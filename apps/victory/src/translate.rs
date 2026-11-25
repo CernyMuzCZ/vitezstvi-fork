@@ -249,6 +249,79 @@ pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>) -> Result<()>
     Ok(())
 }
 
+/// `victory precompile-graphics` (`Command::PrecompileGraphics`).
+#[cfg(windows)]
+pub fn precompile_graphics(
+    archive: Option<PathBuf>,
+    jobs: Option<usize>,
+    limit: Option<usize>,
+    skip: usize,
+    mesh: bool,
+) -> Result<()> {
+    let cfg = victory_core::Config::load()?;
+    let archive = match archive {
+        Some(a) => a,
+        None => crate::default_paths(Vec::new())?
+            .into_iter()
+            .map(|p| p.join("shaders.rpf"))
+            .find(|p| p.is_file())
+            .ok_or_else(|| {
+                anyhow::anyhow!("no shaders.rpf in the configured folders; give its path")
+            })?,
+    };
+    victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
+    let index = cfg.cache_subdir("precompiled")?.join("shaders.rpf.index");
+    let jobs = jobs.unwrap_or_else(|| {
+        std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).max(1))
+    });
+    let started = std::time::Instant::now();
+    let report = victory_hle::modules::d3d12x::precompile_graphics(
+        &archive,
+        Some(&index),
+        jobs,
+        limit,
+        skip,
+        mesh,
+        &|done, r| {
+            println!(
+                "{:6.0} s  {done} records: {} made, {} failed, {} duplicates, {} unmapped, {} undecoded",
+                started.elapsed().as_secs_f64(),
+                r.made,
+                r.failed,
+                r.duplicates,
+                r.unmapped,
+                r.undecoded
+            );
+        },
+    )
+    .map_err(anyhow::Error::msg)?;
+    victory_hle::modules::d3d12x::save_pipeline_cache();
+    println!(
+        "precompile-graphics  {} records: {} pipelines made, {} failed, {} left out, {} duplicates, {} with a shader not in the archive, {} undecoded; {:.0} s",
+        report.records,
+        report.made,
+        report.failed,
+        report.left_out,
+        report.duplicates,
+        report.unmapped,
+        report.undecoded,
+        started.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
+/// `victory precompile-graphics` (`Command::PrecompileGraphics`).
+#[cfg(not(windows))]
+pub fn precompile_graphics(
+    _: Option<PathBuf>,
+    _: Option<usize>,
+    _: Option<usize>,
+    _: usize,
+    _: bool,
+) -> Result<()> {
+    anyhow::bail!("precompiling host graphics pipelines requires Windows")
+}
+
 pub fn run(
     paths: Vec<PathBuf>,
     validate: bool,

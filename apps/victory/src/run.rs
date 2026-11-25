@@ -77,6 +77,13 @@ pub fn run(
     );
     // The console's fixed drives: the package as `G:`, temporary files `T:`.
     victory_hle::modules::files::mount_at('G', title_dir);
+    let shader_pack = title_dir.join("shaders.rpf");
+    if shader_pack.is_file() {
+        victory_hle::modules::d3d12x::use_shader_pack(
+            shader_pack,
+            cfg.cache_subdir("precompiled")?.join("shaders.rpf.index"),
+        );
+    }
     let temp = cfg.data_subdir(&format!("{:08X}/temp", title.id))?;
     victory_hle::modules::files::mount_at('T', &temp);
     victory_hle::runtime::set_title(victory_hle::runtime::Title { storage, ..title });
