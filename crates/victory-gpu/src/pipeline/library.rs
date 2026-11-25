@@ -644,15 +644,16 @@ pub(crate) fn save(now: bool) {
     // added: the library on disk is then what it was, and only the early
     // list is written (a title pipeline first drawn with wrote all 1,352 MB
     // of the library again: run 60's second save).
-    let bytes = {
+    let (bytes, used_changed) = {
         let _all = one_call();
         // No store between asking the size and writing; loads go on.
         let _alone = library.saving.write().unwrap_or_else(|e| e.into_inner());
         let added = library.added.load(Ordering::Relaxed);
-        if !USED_CHANGED.swap(false, Ordering::Relaxed) && added == 0 {
+        let used_changed = USED_CHANGED.swap(false, Ordering::Relaxed);
+        if !used_changed && added == 0 {
             return;
         }
-        if added == 0 {
+        let bytes = if added == 0 {
             0
         } else {
             // SAFETY: a plain query.
@@ -660,15 +661,18 @@ pub(crate) fn save(now: bool) {
             let _call = call("serialise", "the whole library");
             if let Err(e) = serialise(&library.library, &tmp, size) {
                 tracing::warn!(error = %e, "host pipeline library not serialised");
+                if used_changed {
+                    USED_CHANGED.store(true, Ordering::Relaxed);
+                }
                 let _ = std::fs::remove_file(&tmp);
                 return;
             }
             library.added.store(0, Ordering::Relaxed);
             SAVED.store(size as u64, Ordering::Relaxed);
             size
-        }
+        };
+        (bytes, used_changed)
     };
-    let used: Vec<String> = USED.lock().unwrap_or_else(|e| e.into_inner()).iter().flatten().cloned().collect();
     let library_written = if bytes > 0 { replace_library(dir, &tmp) } else { Ok(()) };
     if bytes > 0 && library_written.is_ok() {
         // In place unless the system refused and the new one waits beside it.
@@ -684,12 +688,27 @@ pub(crate) fn save(now: bool) {
             )
         });
     }
-    let written = library_written
-        .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
+    // Only rewrite `early-pipelines.txt` when this process actually recorded
+    // new used pipelines (so offline precompilation never clobbers an existing
+    // early-start list on disk).
+    let (early_count, written) = if used_changed {
+        let used: Vec<String> = used().iter().flatten().cloned().collect();
+        let n = used.len();
+        let res = library_written
+            .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
+        (n, res)
+    } else {
+        let n = USED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map_or(0, HashSet::len);
+        (n, library_written)
+    };
     match written {
         Ok(()) => tracing::info!(
             bytes,
-            early = used.len(),
+            early = early_count,
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),

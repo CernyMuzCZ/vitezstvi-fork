@@ -41,20 +41,26 @@ unsafe impl Send for Pending {}
 // SAFETY: as above.
 unsafe impl Sync for Pending {}
 
+/// Computes the cross-run identity key for a pipeline's shaders and graphics state.
+pub(crate) fn pipeline_key(shaders: &[Arc<Shader>], graphics: Option<&GraphicsState>) -> String {
+    let mut key = blake3::Hasher::new();
+    for s in shaders {
+        key.update(s.stage.as_bytes());
+        key.update(s.hash.as_bytes());
+    }
+    key.update(graphics.map(|g| g.describe()).unwrap_or_default().as_bytes());
+    key.finalize().to_hex()[..32].to_owned()
+}
+
 impl Pending {
     pub(crate) fn new(shaders: Vec<Arc<Shader>>, graphics: Option<Box<GraphicsState>>) -> Pending {
-        let mut key = blake3::Hasher::new();
-        for s in &shaders {
-            key.update(s.stage.as_bytes());
-            key.update(s.hash.as_bytes());
-        }
-        key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
+        let key = pipeline_key(&shaders, graphics.as_deref());
         Pending {
             shaders,
             graphics,
             queue_state: AtomicU8::new(NOT_QUEUED),
             made: OnceLock::new(),
-            key: key.finalize().to_hex()[..32].to_owned(),
+            key,
             used: AtomicBool::new(false),
         }
     }
@@ -135,6 +141,23 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
 pub(crate) fn now(p: &Arc<Pending>) -> bool {
     p.make();
     p.made.get().is_some_and(|made| made.is_some())
+}
+
+/// Offline: translates a graphics pipeline's shaders and builds its host
+/// pipeline into the pipeline library ([`super::precompiled::precompile_graphics`]).
+/// Returns `(key, Some(true))` when made or loaded, `(key, Some(false))` if
+/// translation or the host driver refused it, or `(key, None)` if left out by
+/// `VICTORY_SKIP_PIPELINES`.
+pub(crate) fn warm_graphics(
+    shaders: Vec<Arc<Shader>>,
+    graphics: GraphicsState,
+) -> (String, Option<bool>) {
+    let p = Pending::new(shaders, Some(Box::new(graphics)));
+    if super::skipped_shaders(&p.shaders).is_some() {
+        return (p.key, None);
+    }
+    let made = HostPipeline::new(&p.shaders, p.graphics.as_deref()).is_some();
+    (p.key, Some(made))
 }
 
 /// At the title's creation of a pipeline: starts it at once if an earlier
@@ -483,7 +506,11 @@ mod tests {
             // independent of timing and the driver's graphics pipeline cache.
             assert_eq!(
                 crate::pipeline::hand_out(
-                    vec![], None, &crate::pipeline::PIPELINE_IIDS[0], &mut pipeline,
+                    vec![],
+                    None,
+                    None,
+                    &crate::pipeline::PIPELINE_IIDS[0],
+                    &mut pipeline,
                 ),
                 S_OK
             );

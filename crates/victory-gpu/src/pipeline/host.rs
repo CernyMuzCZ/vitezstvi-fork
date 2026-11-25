@@ -120,6 +120,36 @@ impl Default for GraphicsState {
     }
 }
 
+/// D3D12's default blend of one render target (blending off).
+const DEFAULT_TARGET_BLEND: D3D12_RENDER_TARGET_BLEND_DESC = D3D12_RENDER_TARGET_BLEND_DESC {
+    BlendEnable: windows::core::BOOL(0),
+    LogicOpEnable: windows::core::BOOL(0),
+    SrcBlend: D3D12_BLEND_ONE,
+    DestBlend: D3D12_BLEND_ZERO,
+    BlendOp: D3D12_BLEND_OP_ADD,
+    SrcBlendAlpha: D3D12_BLEND_ONE,
+    DestBlendAlpha: D3D12_BLEND_ZERO,
+    BlendOpAlpha: D3D12_BLEND_OP_ADD,
+    LogicOp: D3D12_LOGIC_OP_NOOP,
+    RenderTargetWriteMask: D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8,
+};
+
+/// Whether a target's blend reads the pixel shader's second output.
+fn dual_source(t: &D3D12_RENDER_TARGET_BLEND_DESC) -> bool {
+    t.BlendEnable.as_bool()
+        && [t.SrcBlend, t.DestBlend, t.SrcBlendAlpha, t.DestBlendAlpha]
+            .iter()
+            .any(|&f| {
+                matches!(
+                    f,
+                    D3D12_BLEND_SRC1_COLOR
+                        | D3D12_BLEND_INV_SRC1_COLOR
+                        | D3D12_BLEND_SRC1_ALPHA
+                        | D3D12_BLEND_INV_SRC1_ALPHA
+                )
+            })
+}
+
 impl GraphicsState {
     /// The blend state the host can make for these render targets. D3D12
     /// refuses a pipeline that blends into a target of an integer format
@@ -128,16 +158,37 @@ impl GraphicsState {
     /// targets and kept for the others; with no integer target that blends
     /// the state is returned as it is (so a logic op on an integer target,
     /// which D3D12 refuses together with independent blending, stays valid).
+    ///
+    /// Dual-source blending (an SRC1 factor on target 0) is D3D12's for
+    /// target 0 alone: the other targets go back to the default blend
+    /// (their write masks kept). The title's pipeline cache has such
+    /// pipelines whose registers repeat target 0's blend on all eight
+    /// targets with no write mask past target 0, which decode as
+    /// independent blending; D3D12 refused them (`E_INVALIDARG`, debug
+    /// layer: "Dual-source color blending cannot be used when BlendEnable
+    /// is set for a RenderTarget above 0").
     pub(crate) fn host_blend(&self) -> D3D12_BLEND_DESC {
         let mut blend = self.blend;
+        if dual_source(&blend.RenderTarget[0]) {
+            for t in &mut blend.RenderTarget[1..] {
+                *t = D3D12_RENDER_TARGET_BLEND_DESC {
+                    RenderTargetWriteMask: t.RenderTargetWriteMask,
+                    ..DEFAULT_TARGET_BLEND
+                };
+            }
+        }
         let n = (self.targets.NumRenderTargets as usize).min(8);
         let independent = blend.IndependentBlendEnable.as_bool();
         // Without independent blending, target 0's state stands for all.
-        let integer = |i: usize| {
-            integer_format(self.targets.RTFormats[i])
-                && self.blend.RenderTarget[if independent { i } else { 0 }].BlendEnable.as_bool()
-        };
-        if !(0..n).any(integer) {
+        let fix: Vec<usize> = (0..n)
+            .filter(|&i| {
+                integer_format(self.targets.RTFormats[i])
+                    && blend.RenderTarget[if independent { i } else { 0 }]
+                        .BlendEnable
+                        .as_bool()
+            })
+            .collect();
+        if fix.is_empty() {
             return blend;
         }
         if !independent {
@@ -145,10 +196,96 @@ impl GraphicsState {
             blend.RenderTarget = [first; 8];
             blend.IndependentBlendEnable = true.into();
         }
-        for i in (0..n).filter(|&i| integer(i)) {
+        for i in fix {
             blend.RenderTarget[i].BlendEnable = false.into();
         }
         blend
+    }
+
+    /// The state of a precompiled pipeline's decoded state blocks
+    /// ([`victory_game::pso_state`]), as [`GraphicsState::read`] takes in
+    /// the same fields from a stream (formats through the same
+    /// conversions).
+    pub(crate) fn from_precompiled(d: &victory_game::pso_state::GraphicsDesc) -> GraphicsState {
+        let mut g = GraphicsState::default();
+        let target = |t: &victory_game::pso_state::TargetBlend| D3D12_RENDER_TARGET_BLEND_DESC {
+            BlendEnable: t.blend.into(),
+            LogicOpEnable: t.logic_op_enable.into(),
+            SrcBlend: D3D12_BLEND(t.src as i32),
+            DestBlend: D3D12_BLEND(t.dst as i32),
+            BlendOp: D3D12_BLEND_OP(t.op as i32),
+            SrcBlendAlpha: D3D12_BLEND(t.src_alpha as i32),
+            DestBlendAlpha: D3D12_BLEND(t.dst_alpha as i32),
+            BlendOpAlpha: D3D12_BLEND_OP(t.op_alpha as i32),
+            LogicOp: D3D12_LOGIC_OP(t.logic_op as i32),
+            RenderTargetWriteMask: t.write_mask,
+        };
+        g.blend = D3D12_BLEND_DESC {
+            AlphaToCoverageEnable: d.alpha_to_coverage.into(),
+            IndependentBlendEnable: d.independent_blend.into(),
+            RenderTarget: d.targets_blend.each_ref().map(target),
+        };
+        g.sample_mask = d.sample_mask;
+        g.rasterizer = D3D12_RASTERIZER_DESC {
+            FillMode: D3D12_FILL_MODE(d.fill_mode as i32),
+            CullMode: D3D12_CULL_MODE(d.cull_mode as i32),
+            FrontCounterClockwise: d.front_ccw.into(),
+            DepthBias: d.depth_bias,
+            DepthBiasClamp: d.depth_bias_clamp,
+            SlopeScaledDepthBias: d.slope_scaled_depth_bias,
+            DepthClipEnable: d.depth_clip.into(),
+            ..Default::default()
+        };
+        let face = |f: &victory_game::pso_state::StencilFace| D3D12_DEPTH_STENCILOP_DESC {
+            StencilFailOp: D3D12_STENCIL_OP(f.fail as i32),
+            StencilDepthFailOp: D3D12_STENCIL_OP(f.depth_fail as i32),
+            StencilPassOp: D3D12_STENCIL_OP(f.pass as i32),
+            StencilFunc: D3D12_COMPARISON_FUNC(f.func as i32),
+        };
+        g.depth = D3D12_DEPTH_STENCIL_DESC {
+            DepthEnable: d.depth_enable.into(),
+            DepthWriteMask: D3D12_DEPTH_WRITE_MASK(d.depth_write as i32),
+            DepthFunc: D3D12_COMPARISON_FUNC(d.depth_func as i32),
+            StencilEnable: d.stencil_enable.into(),
+            StencilReadMask: d.stencil_read_mask,
+            StencilWriteMask: d.stencil_write_mask,
+            FrontFace: face(&d.front),
+            BackFace: face(&d.back),
+        };
+        g.depth_bounds = d.depth_bounds;
+        g.names = d
+            .inputs
+            .iter()
+            .map(|e| CString::new(e.name.as_str()).unwrap_or_default())
+            .collect();
+        g.inputs = d
+            .inputs
+            .iter()
+            .zip(&g.names)
+            .map(|(e, name)| D3D12_INPUT_ELEMENT_DESC {
+                SemanticName: PCSTR(name.as_ptr().cast()),
+                SemanticIndex: e.index,
+                Format: DXGI_FORMAT(crate::resource::pc_format(e.format) as i32),
+                InputSlot: e.slot,
+                AlignedByteOffset: e.offset,
+                InputSlotClass: D3D12_INPUT_CLASSIFICATION(e.class as i32),
+                InstanceDataStepRate: e.step_rate,
+            })
+            .collect();
+        g.strip_cut = D3D12_INDEX_BUFFER_STRIP_CUT_VALUE(d.strip_cut as i32);
+        g.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE(d.topology as i32);
+        g.targets = D3D12_RT_FORMAT_ARRAY {
+            RTFormats: d.target_formats.map(|f| {
+                DXGI_FORMAT(crate::resource::target_format(crate::resource::pc_format(f)) as i32)
+            }),
+            NumRenderTargets: d.num_targets,
+        };
+        g.depth_format = DXGI_FORMAT(crate::resource::pc_format(d.depth_format) as i32);
+        g.samples = DXGI_SAMPLE_DESC {
+            Count: d.sample_count,
+            Quality: d.sample_quality,
+        };
+        g
     }
 
     /// Takes in one subobject of a stream: its type, then its data at +4
@@ -1275,6 +1412,41 @@ mod tests {
         let b = g.host_blend();
         assert!(!b.IndependentBlendEnable.as_bool());
         assert!(b.RenderTarget[0].BlendEnable.as_bool());
+    }
+
+    /// A dual-source blend repeated on all eight targets (as the title's
+    /// pipeline cache records it) keeps it on target 0 only.
+    #[test]
+    fn dual_source_blending_stays_on_target_0() {
+        for independent in [false, true] {
+            let mut g = GraphicsState::default();
+            g.blend.IndependentBlendEnable = independent.into();
+            g.targets.NumRenderTargets = 1;
+            g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+            for (i, t) in g.blend.RenderTarget.iter_mut().enumerate() {
+                t.BlendEnable = true.into();
+                t.SrcBlend = D3D12_BLEND_SRC_ALPHA;
+                t.DestBlend = D3D12_BLEND_INV_SRC1_COLOR;
+                t.DestBlendAlpha = D3D12_BLEND_INV_SRC1_ALPHA;
+                t.RenderTargetWriteMask = if i == 0 { 0xf } else { 0 };
+            }
+            let b = g.host_blend();
+            assert_eq!(b.IndependentBlendEnable.as_bool(), independent);
+            assert!(b.RenderTarget[0].BlendEnable.as_bool());
+            assert_eq!(b.RenderTarget[0].DestBlend, D3D12_BLEND_INV_SRC1_COLOR);
+            assert_eq!(b.RenderTarget[0].RenderTargetWriteMask, 0xf);
+            for t in &b.RenderTarget[1..] {
+                assert!(!t.BlendEnable.as_bool());
+                assert!(
+                    !dual_source(t)
+                        && t.DestBlend == D3D12_BLEND_ZERO
+                        && t.DestBlendAlpha == D3D12_BLEND_ZERO
+                );
+                assert_eq!(t.RenderTargetWriteMask, 0);
+            }
+            // The state a run names the pipeline by is not changed.
+            assert_eq!(g.blend.RenderTarget[7].DestBlend, D3D12_BLEND_INV_SRC1_COLOR);
+        }
     }
 
     /// The host refuses a pipeline that blends into an integer target; with

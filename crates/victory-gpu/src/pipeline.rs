@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, PIPELINE, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
 
-const PIPELINE_IIDS: [Iid; 4] = [
+pub(crate) const PIPELINE_IIDS: [Iid; 4] = [
     guid(
         0x765a30f3,
         0xf624,
@@ -62,7 +62,7 @@ pub(crate) struct Shader {
     pub(crate) stage: &'static str,
     /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
-    container: Vec<u8>,
+    pub(crate) container: Vec<u8>,
     /// Its result is replaced by the stand-in for indirect light
     /// ([`crate::ambient`]).
     #[cfg(windows)]
@@ -122,7 +122,7 @@ pub(crate) fn kept() -> [u64; 7] {
 }
 
 /// The shared container for `bytes`.
-fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
+pub(crate) fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
     let full = blake3::hash(bytes);
     let mut shaders = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
     shaders
@@ -580,11 +580,11 @@ fn stores_by_address(program: &victory_shader::NativeProgram) -> bool {
 }
 
 #[repr(C)]
-struct Pipeline {
+pub(crate) struct Pipeline {
     object: Object,
     packet: [u32; 8],
     /// Each used stage's container.
-    shaders: Vec<Arc<Shader>>,
+    pub(crate) shaders: Vec<Arc<Shader>>,
     /// Whether a list has bound it yet (its shaders are logged then).
     bound: std::sync::atomic::AtomicBool,
     /// What its host pipeline is made from, and the host pipeline once made
@@ -599,13 +599,17 @@ struct Pipeline {
     /// on first need.
     #[cfg(windows)]
     limited: OnceLock<Option<host::HostPipeline>>,
+    /// What a precompiled pipeline (device methods 0x1c8 and 0x218) was
+    /// made from; `None` for plain and stream pipelines.
+    #[allow(dead_code)]
+    pub(crate) precompiled: Option<Precompiled>,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
 /// Stage names, in description order.
 const GRAPHICS_STAGES: [&str; 5] = ["vertex", "pixel", "domain", "hull", "geometry"];
 
-fn pipeline<'a>(this: This) -> &'a Pipeline {
+pub(crate) fn pipeline<'a>(this: This) -> &'a Pipeline {
     // SAFETY: the title passes one of our pipelines.
     unsafe { &*this.cast::<Pipeline>() }
 }
@@ -707,12 +711,12 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
         .collect()
 }
 
-/// The shader of `p` the user asked to drop (`VICTORY_SKIP_PIPELINES`, a
+/// The shader of `shaders` the user asked to drop (`VICTORY_SKIP_PIPELINES`, a
 /// comma-separated list of 16-digit shader hashes), if any. Available in
 /// release builds as well as diagnostics builds so pipeline bisection does not
 /// perturb timing; only the reporting (`note_drop`) stays behind `diagnostics`.
 #[cfg(windows)]
-fn skipped_shader(p: &Pipeline) -> Option<&str> {
+pub(crate) fn skipped_shaders(shaders: &[Arc<Shader>]) -> Option<&str> {
     static HASHES: OnceLock<Vec<String>> = OnceLock::new();
     let hashes = HASHES.get_or_init(|| {
         let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
@@ -721,10 +725,15 @@ fn skipped_shader(p: &Pipeline) -> Option<&str> {
     if hashes.is_empty() {
         return None;
     }
-    p.shaders
+    shaders
         .iter()
         .find(|shader| hashes.contains(&shader.hash))
         .map(|shader| shader.hash.as_str())
+}
+
+#[cfg(windows)]
+fn skipped_shader(p: &Pipeline) -> Option<&str> {
+    skipped_shaders(&p.shaders)
 }
 
 #[cfg(windows)]
@@ -742,6 +751,12 @@ pub(crate) fn note_drop(this: This) {
         let p = pipeline(this);
         skipped_shader(p)
             .map(|hash| format!("skipped shader {hash}"))
+            .or_else(|| {
+                (p.precompiled.is_some() && p.shaders.is_empty()).then(|| {
+                    "precompiled pipeline without a host pipeline (VICTORY_PRECOMPILED_PSO=stub)"
+                        .to_owned()
+                })
+            })
             .or_else(|| make::missing(&p.host))
     };
     if let Some(why) = why {
@@ -779,9 +794,10 @@ fn copy(stage: &'static str, code: &Bytecode) -> Option<Arc<Shader>> {
     }))
 }
 
-fn hand_out(
+pub(crate) fn hand_out(
     shaders: Vec<Arc<Shader>>,
     #[cfg(windows)] graphics: Option<Box<host::GraphicsState>>,
+    precompiled: Option<Precompiled>,
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
@@ -810,6 +826,7 @@ fn hand_out(
         limited: OnceLock::new(),
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
+        precompiled,
     });
     object::hand_out(PIPELINE, pipeline, iid, &PIPELINE_IIDS, out)
 }
@@ -831,6 +848,7 @@ pub(crate) extern "system" fn create_graphics(
         shaders,
         #[cfg(windows)]
         None,
+        None,
         iid,
         out,
     )
@@ -850,6 +868,7 @@ pub(crate) extern "system" fn create_compute(
     hand_out(
         copy("compute", &desc.stage).into_iter().collect(),
         #[cfg(windows)]
+        None,
         None,
         iid,
         out,
@@ -953,6 +972,7 @@ pub(crate) extern "system" fn create_stream(
         shaders,
         #[cfg(windows)]
         Some(Box::new(graphics)),
+        None,
         iid,
         out,
     )
@@ -979,6 +999,13 @@ static FUNCTIONS: Table<24> = {
 pub(crate) mod host;
 #[cfg(windows)]
 mod library;
+mod pack;
+mod precompiled;
+pub use pack::use_shader_pack;
+pub use precompiled::PrecompileReport;
+#[cfg(windows)]
+pub use precompiled::precompile_graphics;
+pub(crate) use precompiled::{Precompiled, create_precompiled};
 
 /// Host pipelines created and loaded from the library since the start
 /// (`crate::framelog`).
