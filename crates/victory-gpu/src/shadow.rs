@@ -79,6 +79,9 @@ pub(crate) struct Shadow {
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
     /// Optional `>= 1 TiB` alias view kept alive past `place` (`heap`).
     alias: Option<crate::inplace::AliasView>,
+    /// Submission number (`crate::host::started`) after this buffer was
+    /// allocated (see `HostTexture::born_after`).
+    born_after: AtomicU64,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -2533,6 +2536,16 @@ impl Shadow {
         self.id
     }
 
+    /// Submission number after which this copy's host buffer was allocated.
+    pub(crate) fn born_after(&self) -> u64 {
+        self.born_after.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_born_after(&self, born: u64) {
+        self.born_after.store(born, Ordering::Relaxed);
+    }
+
     /// Whether the copy is of a window of memory outside buffers.
     #[cfg(feature = "diagnostics")]
     pub(crate) fn is_window(&self) -> bool {
@@ -2596,6 +2609,7 @@ impl Shadow {
             window: false,
             place: None,
             alias: None,
+            born_after: AtomicU64::new(crate::host::started()),
         }
     }
 

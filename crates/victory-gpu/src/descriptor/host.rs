@@ -133,6 +133,51 @@ pub(crate) struct HostHeap {
     /// other memory there makes stale, and which to look at again when the
     /// runtime maps, unmaps or writes memory ([`remapped`]).
     placed: std::sync::Arc<Mutex<Spans>>,
+    /// Title slots whose view points to a host resource created while an
+    /// earlier submission was still on the card (`born_after > finished`):
+    /// (slot, title handle, for_draw, born_after, required_before_submit).
+    deferred_views: Mutex<Vec<(u32, u64, bool, u64, bool)>>,
+}
+
+/// Counts of title-slot descriptor writes deferred because their host
+/// resource was allocated while an earlier submission was on the card:
+/// `[deferred, flushed]`.
+pub(crate) static DEFERRED_VIEWS: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+fn defer_new_views_from(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|v| v == "1")
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Per-thread override of [`defer_new_views`] so deferral tests never
+    /// race concurrent GPU tests sharing the process-wide `Host`.
+    static TEST_DEFER: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether title-slot descriptor writes pointing to newly-allocated host
+/// resources wait for earlier submissions to finish before touching the live
+/// shader-visible heap (`VICTORY_DEFER_NEW_VIEWS=1` enables; off by default
+/// because Windows WDDM D3D12 maps newly created resources synchronously and
+/// deferring adds `settle` stalls under `VICTORY_LATE_WAIT=1`).
+fn defer_new_views() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_DEFER.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| defer_new_views_from(std::env::var_os("VICTORY_DEFER_NEW_VIEWS").as_deref()))
+}
+
+/// Result of [`make_checked`]: made (holding the optional resource and
+/// resolved buffer copy), refused (`None`), or deferred because the resource
+/// was created after submission `born_after` which has not finished on the
+/// card yet.
+enum Make {
+    Made(Kept, Option<BufferCopy>),
+    None,
+    Deferred(u64),
 }
 
 /// State kept under [`HostHeap::made`]: both keys and the heap map's slot
@@ -1254,6 +1299,7 @@ impl HostHeap {
                 }
                 spans
             },
+            deferred_views: Mutex::default(),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -2468,9 +2514,10 @@ impl HostHeap {
             let mut changed = Vec::new();
             {
                 let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+                let max_born = defer_new_views().then(crate::host::finished);
                 for &(index, handle) in due.iter() {
                     let batch = Some(&mut changed);
-                    self.mirror_with_made(&mut made, index, handle, false, true, batch);
+                    self.mirror_with_made(&mut made, index, handle, false, false, true, max_born, batch);
                 }
             }
             if !changed.is_empty() {
@@ -2509,8 +2556,69 @@ impl HostHeap {
     /// there. Buffer views are made only for draws (`for_draw`), which also
     /// copy their data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
-        self.mirror_inner(index, handle, for_draw, true)
+        self.mirror_inner(index, handle, for_draw, false, true, defer_new_views().then(crate::host::finished))
             .map(|(view, _)| view)
+    }
+
+    /// As [`HostHeap::mirror`], marking a deferred new-resource view as
+    /// required before the next submission runs (for draws that bind title
+    /// slots directly through a non-fresh table).
+    pub(crate) fn mirror_required(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
+        self.mirror_inner(index, handle, for_draw, true, true, defer_new_views().then(crate::host::finished))
+            .map(|(view, _)| view)
+    }
+
+    /// Whether any deferred title-slot view is marked required before the
+    /// next submission runs.
+    pub(crate) fn has_required_deferred(&self, finished: u64) -> bool {
+        let deferred = self.deferred_views.lock().unwrap_or_else(|e| e.into_inner());
+        deferred
+            .iter()
+            .any(|&(_, _, _, born_after, required)| required && born_after > finished)
+    }
+
+    /// Publishes deferred title-slot views whose `born_after <= finished`.
+    pub(crate) fn flush_deferred(&self, finished: u64) -> usize {
+        let ready: Vec<(u32, u64, bool, bool)> = {
+            let mut deferred = self.deferred_views.lock().unwrap_or_else(|e| e.into_inner());
+            if deferred.is_empty() {
+                return 0;
+            }
+            let mut ready = Vec::new();
+            let mut keep = Vec::new();
+            for entry in deferred.drain(..) {
+                if entry.3 <= finished {
+                    ready.push((entry.0, entry.1, entry.2, entry.4));
+                } else {
+                    keep.push(entry);
+                }
+            }
+            *deferred = keep;
+            ready
+        };
+        if ready.is_empty() {
+            return 0;
+        }
+        // Keep the latest request per slot (upgrading `for_draw` / `required`).
+        let mut by_slot: std::collections::BTreeMap<u32, (u64, bool, bool)> =
+            std::collections::BTreeMap::new();
+        for (index, handle, for_draw, required) in ready {
+            by_slot
+                .entry(index)
+                .and_modify(|e| {
+                    e.0 = handle;
+                    e.1 |= for_draw;
+                    e.2 |= required;
+                })
+                .or_insert((handle, for_draw, required));
+        }
+        let n = by_slot.len();
+        let max_born = defer_new_views().then_some(finished);
+        for (index, (handle, for_draw, required)) in by_slot {
+            self.mirror_inner(index, handle, for_draw, required, false, max_born);
+        }
+        DEFERRED_VIEWS[1].fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+        n
     }
 
     /// [`HostHeap::mirror`] for the pass over slots whose buffer view was
@@ -2520,7 +2628,7 @@ impl HostHeap {
     /// reads ([`buffer_copy`]) comes with it when making the view resolved
     /// it, so the pass need not look it up again.
     pub(crate) fn mirror_heap_buffer(&self, index: u32, handle: u64) -> Option<(View, Option<BufferCopy>)> {
-        self.mirror_inner(index, handle, true, false)
+        self.mirror_inner(index, handle, true, false, false, defer_new_views().then(crate::host::finished))
     }
 
     /// The view at `handle`, made on slot `index` if it changed since, and
@@ -2532,23 +2640,28 @@ impl HostHeap {
         index: u32,
         handle: u64,
         for_draw: bool,
+        required: bool,
         record_change: bool,
+        max_born: Option<u64>,
     ) -> Option<(View, Option<BufferCopy>)> {
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-        self.mirror_with_made(&mut made, index, handle, for_draw, record_change, None)
+        self.mirror_with_made(&mut made, index, handle, for_draw, required, record_change, max_born, None)
     }
 
     /// [`HostHeap::mirror_inner`] with the records already locked, for a
     /// whole page of them (`mirror_copied_page`): `batch`, when given, takes
     /// the buffer slots whose membership changed instead of each locking
     /// [`HostHeap::changed`].
+    #[allow(clippy::too_many_arguments)]
     fn mirror_with_made(
         &self,
         made: &mut Made,
         index: u32,
         handle: u64,
         for_draw: bool,
+        required: bool,
         record_change: bool,
+        max_born: Option<u64>,
         mut batch: Option<&mut Vec<u32>>,
     ) -> Option<(View, Option<BufferCopy>)> {
         let mirrored = self.mirrored_count();
@@ -2637,13 +2750,42 @@ impl HostHeap {
                     self.keep(host, None);
                 }
             } else {
-                made.keys[host as usize] = key;
-                match make(&view, self.cpu(host)) {
-                    Some((kept, copy)) => {
+                match make_checked(&view, self.cpu(host), max_born) {
+                    Make::Deferred(born_after) => {
+                        if taken {
+                            // A freshly assigned pool slot (`taken`) still
+                            // holds its previous quarantined descriptor and is
+                            // not yet in the GPU-visible heap map: make it a
+                            // valid null view and publish it now while leaving
+                            // `made.keys[host] = 0` so `flush_deferred` writes
+                            // the real view into the same published pool slot
+                            // once earlier submissions finish.
+                            made.keys[host as usize] = 0;
+                            if !self.sampler {
+                                null_for(&view, self.cpu(host));
+                            }
+                            self.keep(host, None);
+                            self.publish(made, index);
+                            #[cfg(feature = "diagnostics")]
+                            note_pool(made);
+                        }
+                        // Leave `made.keys[host]`, the live descriptor slot,
+                        // and `kept[host]` untouched until earlier submissions
+                        // finish on the card.
+                        DEFERRED_VIEWS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        self.deferred_views
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push((index, handle, for_draw, born_after, required));
+                        return Some((view, None));
+                    }
+                    Make::Made(kept, copy) => {
+                        made.keys[host as usize] = key;
                         self.keep(host, kept);
                         resolved = copy;
                     }
-                    None => {
+                    Make::None => {
+                        made.keys[host as usize] = key;
                         if !self.sampler {
                             null_for(&view, self.cpu(host));
                         }
@@ -3149,8 +3291,11 @@ fn buffer_srv(
     mut desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
     buffer_view: bool,
-) -> Option<(Kept, Option<BufferCopy>)> {
-    let whole = crate::shadow::find(address, len)?;
+    max_born: Option<u64>,
+) -> Make {
+    let Some(whole) = crate::shadow::find(address, len) else {
+        return Make::None;
+    };
     let offset = whole.offset(address);
     // The title range the view reads ([`buffer_range`]): what `buffer_copy`
     // reports the copy of a made slot with.
@@ -3203,7 +3348,7 @@ fn buffer_srv(
                 element,
                 "buffer view not on an element of its host copy"
             );
-            return None;
+            return Make::None;
         }
         buffer.FirstElement += offset / element;
     }
@@ -3222,11 +3367,14 @@ fn buffer_srv(
             width,
             "buffer view the host would refuse left null"
         );
-        return None;
+        return Make::None;
     }
     // The console has no component mapping; one the host does not know is the default's.
     if desc.Shader4ComponentMapping != D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING {
         desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    }
+    if max_born.is_some_and(|done| shadow.born_after() > done) {
+        return Make::Deferred(shadow.born_after());
     }
     // The copy this slot now shows, as `buffer_copy` reports it: a copy of
     // the view's own bytes, else the whole buffer's, which the view lies in
@@ -3238,13 +3386,15 @@ fn buffer_srv(
         }
         None => None,
     };
-    let host = host()?;
+    let Some(host) = host() else {
+        return Make::None;
+    };
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
         host.device
             .CreateShaderResourceView(&shadow.buffer, Some(&desc), at)
     };
-    Some((Some(shadow.buffer.clone()), copy))
+    Make::Made(Some(shadow.buffer.clone()), copy)
 }
 
 /// An unordered access view of title buffer memory at `address` (`len`
@@ -3258,8 +3408,11 @@ fn buffer_uav(
     mut desc: D3D12_UNORDERED_ACCESS_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
     buffer_view: bool,
-) -> Option<(Kept, Option<BufferCopy>)> {
-    let whole = crate::shadow::find(address, len)?;
+    max_born: Option<u64>,
+) -> Make {
+    let Some(whole) = crate::shadow::find(address, len) else {
+        return Make::None;
+    };
     // The title range the view reads ([`buffer_range`]: `None` where it finds
     // none): what `buffer_copy` reports the copy of a made slot with.
     let range = {
@@ -3304,7 +3457,7 @@ fn buffer_uav(
     let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
     if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
         once!("unordered access to a buffer whose host copy shaders cannot write");
-        return None;
+        return Make::None;
     }
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
@@ -3328,7 +3481,7 @@ fn buffer_uav(
     } else {
         if element == 0 || offset % element != 0 {
             once!(offset, element, "unordered buffer view not on an element of its host copy");
-            return None;
+            return Make::None;
         }
         buffer.FirstElement += offset / element;
     }
@@ -3353,9 +3506,14 @@ fn buffer_uav(
             width,
             "unordered buffer view the host would refuse left null"
         );
-        return None;
+        return Make::None;
     }
-    let host = host()?;
+    if max_born.is_some_and(|done| shadow.born_after() > done) {
+        return Make::Deferred(shadow.born_after());
+    }
+    let Some(host) = host() else {
+        return Make::None;
+    };
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
         host.device
@@ -3373,7 +3531,7 @@ fn buffer_uav(
         }
         _ => None,
     };
-    Some((Some(shadow.buffer.clone()), copy))
+    Make::Made(Some(shadow.buffer.clone()), copy)
 }
 
 /// Whether the host can make a shader (or unordered access) view of
@@ -3545,18 +3703,35 @@ fn constant_view_size(size: u32) -> u32 {
 /// host copy it reads ([`BufferCopy`]), so that the pass that mirrors it
 /// ([`HostHeap::mirror_heap_buffer`]) need not look the copy up again.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<(Kept, Option<BufferCopy>)> {
-    let host = host()?;
+    match make_checked(view, at, None) {
+        Make::Made(kept, copy) => Some((kept, copy)),
+        Make::None | Make::Deferred(_) => None,
+    }
+}
+
+/// As [`make`], but when `max_born` is `Some(finished)` and the backing host
+/// resource was allocated after submission `born_after > finished`, leaves
+/// `at` untouched and returns [`Make::Deferred`].
+fn make_checked(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE, max_born: Option<u64>) -> Make {
+    let Some(host) = host() else {
+        return Make::None;
+    };
     let device = &host.device;
     match view {
         &View::Constant(address, size) => {
-            let shadow = crate::shadow::find(address, u64::from(size))?;
+            let Some(shadow) = crate::shadow::find(address, u64::from(size)) else {
+                return Make::None;
+            };
             let gpu = shadow.gpu(address);
             if gpu % 256 != 0 {
                 once!(
                     address = format_args!("{address:#x}"),
                     "constant buffer not 256-byte aligned on the host"
                 );
-                return None;
+                return Make::None;
+            }
+            if max_born.is_some_and(|done| shadow.born_after() > done) {
+                return Make::Deferred(shadow.born_after());
             }
             let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
                 BufferLocation: gpu,
@@ -3564,7 +3739,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<(Kept, Option<Bu
             };
             // SAFETY: a slot of our heap; the range lies in the host copy.
             unsafe { device.CreateConstantBufferView(Some(&desc), at) };
-            Some((Some(shadow.buffer.clone()), None))
+            Make::Made(Some(shadow.buffer.clone()), None)
         }
         View::Shader(resource, desc) => {
             let resource = *resource as crate::object::This;
@@ -3595,7 +3770,13 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<(Kept, Option<Bu
                 }
                 let mut desc = desc.as_ref().map(srv_desc);
                 if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
-                    return None;
+                    return Make::None;
+                }
+                if let Some(done) = max_born {
+                    let born = crate::resource::host_born_after(resource);
+                    if born > done {
+                        return Make::Deferred(born);
+                    }
                 }
                 // Levels on demand (`crate::tiles`): a texture made level by
                 // level exposes only a contiguous run of resident mips so
@@ -3628,15 +3809,15 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<(Kept, Option<Bu
                         at,
                     )
                 };
-                Some((Some(texture.clone()), None))
+                Make::Made(Some(texture.clone()), None)
             } else if let (Some((data, len)), Some(desc)) =
                 (crate::resource::buffer_bytes(resource), desc)
             {
                 // Buffer views: dimension 1 (`buffer_fields`).
                 const BUFFER: u32 = 1;
-                buffer_srv(data as u64, len, srv_desc(desc), at, desc[1] == BUFFER)
+                buffer_srv(data as u64, len, srv_desc(desc), at, desc[1] == BUFFER, max_born)
             } else {
-                None
+                Make::None
             }
         }
         View::Unordered(resource, _counter, desc) => {
@@ -3646,9 +3827,9 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<(Kept, Option<Bu
                     (Some((data, len)), Some(desc)) => {
                         // Buffer views: dimension 1 (`buffer_fields`).
                         const BUFFER: u32 = 1;
-                        buffer_uav(data as u64, len, uav_desc(desc), at, desc[1] == BUFFER)
+                        buffer_uav(data as u64, len, uav_desc(desc), at, desc[1] == BUFFER, max_born)
                     }
-                    _ => None,
+                    _ => Make::None,
                 };
             };
             // The first such views of depth textures are logged as the
@@ -3683,7 +3864,13 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<(Kept, Option<Bu
                 None => texture,
             };
             if !fits(texture, desc.as_mut().map(|d| &mut d.Format), true) {
-                return None;
+                return Make::None;
+            }
+            if let Some(done) = max_born {
+                let born = crate::resource::host_born_after(resource);
+                if born > done {
+                    return Make::Deferred(born);
+                }
             }
             // SAFETY: a live texture and a slot of our heap.
             unsafe {
@@ -3694,7 +3881,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<(Kept, Option<Bu
                     at,
                 )
             };
-            Some((Some(texture.clone()), None))
+            Make::Made(Some(texture.clone()), None)
         }
         View::Sampler(words) => {
             // SAFETY: 13 words in the host's layout.
@@ -3705,17 +3892,17 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<(Kept, Option<Bu
             };
             // SAFETY: a slot of our sampler heap.
             unsafe { device.CreateSampler(&desc, at) };
-            Some((None, None))
+            Make::Made(None, None)
         }
         View::ConsoleSampler(words) => {
             let desc = crate::sampler::console(words);
             // SAFETY: a slot of our sampler heap.
             unsafe { device.CreateSampler(&desc, at) };
-            Some((None, None))
+            Make::Made(None, None)
         }
         View::Placed(unordered, resource, desc) => {
             if let Some(view) = placed_texture(view) {
-                return make(&view, at);
+                return make_checked(&view, at, max_born);
             }
             const BUFFER: u32 = 1;
             if resource[0] != BUFFER {
@@ -3723,7 +3910,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<(Kept, Option<Bu
                 // itself is not mirrored; give it a resource as shader
                 // views of such textures get when a dispatch writes one.
                 once!(dimension = resource[0], "placed unordered texture view not mirrored");
-                return None;
+                return Make::None;
             }
             // The resource description's width, after the alignment.
             let len = u64::from(resource[4]) | u64::from(resource[5]) << 32;
@@ -3732,12 +3919,12 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<(Kept, Option<Bu
             // An empty title buffer: nothing to view, and no host copy to
             // look for (#70: such views were in flight at device removals).
             if len == 0 {
-                return None;
+                return Make::None;
             }
             if *unordered {
-                buffer_uav(address, len, uav_desc(words), at, true)
+                buffer_uav(address, len, uav_desc(words), at, true, max_born)
             } else {
-                buffer_srv(address, len, srv_desc(words), at, true)
+                buffer_srv(address, len, srv_desc(words), at, true, max_born)
             }
         }
     }
@@ -5305,6 +5492,80 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
 
         // SAFETY: release our test allocation.
         unsafe { VirtualFree(base, 0, MEM_RELEASE) };
+    }
+
+    struct TestDeferGuard(Option<bool>);
+
+    impl TestDeferGuard {
+        fn set(on: bool) -> Self {
+            Self(TEST_DEFER.replace(Some(on)))
+        }
+    }
+
+    impl Drop for TestDeferGuard {
+        fn drop(&mut self) {
+            TEST_DEFER.set(self.0);
+        }
+    }
+
+    #[test]
+    fn defer_new_views_switch_respects_opt_in_and_zero_disable() {
+        use std::ffi::OsStr;
+        assert!(!defer_new_views_from(None));
+        assert!(defer_new_views_from(Some(OsStr::new("1"))));
+        assert!(!defer_new_views_from(Some(OsStr::new("0"))));
+    }
+
+    #[test]
+    fn deferred_views_hold_back_new_resources_and_flush_on_mapped_and_identity_slots() {
+        if crate::host::host().is_none() {
+            return;
+        }
+        let _defer = TestDeferGuard::set(true);
+        let _guard = TestMapGuard::set((16, 17));
+        let Some(heap) = HostHeap::new(false, 32) else {
+            return;
+        };
+        let mut backing = vec![0u8; 8192];
+        let addr = (backing.as_mut_ptr() as u64).next_multiple_of(256);
+        let Some(shadow) = crate::shadow::find(addr, 4096) else {
+            return;
+        };
+        let born = crate::host::finished() + 10;
+        shadow.set_born_after(born);
+
+        let mut slots = [[0u32; 8]; 32];
+        let base = slots.as_mut_ptr() as u64;
+        let handle = |i: u32| base + u64::from(i) * TITLE_SLOT_BYTES;
+        let view = View::Constant(addr, 256);
+
+        // Identity slot (below window=16), required before submit.
+        crate::descriptor::record(handle(1), view.clone());
+        assert!(heap.mirror_required(1, handle(1), true).is_some());
+        assert!(!heap.made(1), "new-resource view must stay deferred while born_after > finished");
+        assert!(heap.has_required_deferred(born - 1));
+        assert!(!heap.has_required_deferred(born));
+        assert_eq!(heap.flush_deferred(born - 1), 0);
+        assert!(!heap.made(1));
+
+        // Mapped pool slot (at window=16), non-required: assigns and publishes
+        // a null pool slot now, then writes the real view on flush.
+        crate::descriptor::record(handle(16), view);
+        assert!(heap.mirror(16, handle(16), true).is_some());
+        assert!(!heap.made(16), "mapped pool slot view stays deferred until finished >= born_after");
+        let m = heap.map.as_ref().expect("heap map active");
+        // SAFETY: slot 16 is index 0 of the map buffer.
+        let entry_before = unsafe { (m.at as *const u32).read_volatile() };
+        assert_ne!(entry_before, 0, "freshly assigned pool slot is published null rather than orphaned");
+
+        // Flush once submission `born` finishes: both identity and mapped slots publish.
+        assert_eq!(heap.flush_deferred(born), 2);
+        assert!(heap.made(1));
+        assert!(heap.made(16));
+        assert!(!heap.has_required_deferred(born - 1));
+        // SAFETY: slot 16 is index 0 of the map buffer.
+        let entry_after = unsafe { (m.at as *const u32).read_volatile() };
+        assert_eq!(entry_after, entry_before, "flushed view reuses the published pool slot");
     }
 }
 
