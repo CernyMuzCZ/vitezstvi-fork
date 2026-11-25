@@ -1840,6 +1840,9 @@ mod host {
 
         fn keys(&mut self) -> Vec<KeyState> {
             let focus = self.focus();
+            // A press from before the window had focus is not the title's: the first look
+            // after focus returns reads the low bits only to clear them.
+            let fresh = focus && !self.was_focused;
             self.cursor(focus);
             #[cfg(feature = "diagnostics")]
             let mut down = {
@@ -1854,8 +1857,13 @@ mod host {
                 // mouse buttons (below 0x08).
                 let held: Vec<u8> = (0x08..=0xFE_u8)
                     .filter(|vk| !(0x10..=0x12).contains(vk) && !down.contains(vk))
+                    // Down now, or pressed since the last look (the low bit): a title that
+                    // asks once a frame at a frame a second still sees a tap between two asks.
                     // SAFETY: plain queries.
-                    .filter(|&vk| unsafe { GetAsyncKeyState(i32::from(vk)) } < 0)
+                    .filter(|&vk| {
+                        let state = unsafe { GetAsyncKeyState(i32::from(vk)) };
+                        state < 0 || (!fresh && state & 1 != 0)
+                    })
                     .collect();
                 down.extend(held);
             }
@@ -1906,7 +1914,8 @@ mod host {
     }
 
     /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
-    /// 0.2 s that long after input starts, with or without focus. A key is a
+    /// 0.2 s (`VICTORY_KEYS_HOLD_MS`: that long instead, for runs at a frame a
+    /// second) that long after input starts, with or without focus. A key is a
     /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
     /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
     #[cfg(feature = "diagnostics")]
@@ -1936,17 +1945,19 @@ mod host {
             });
             (Instant::now(), keys.collect())
         });
+        static HOLD: LazyLock<Duration> = LazyLock::new(|| {
+            let ms = std::env::var("VICTORY_KEYS_HOLD_MS").ok().and_then(|v| v.parse().ok());
+            Duration::from_millis(ms.unwrap_or(200))
+        });
         let (start, keys) = &*SCRIPT;
-        active_scripted_keys(keys, start.elapsed())
+        active_scripted_keys(keys, start.elapsed(), *HOLD)
     }
 
     #[cfg(any(test, feature = "diagnostics"))]
-    fn active_scripted_keys(keys: &[(Duration, u8)], now: Duration) -> Vec<u8> {
+    fn active_scripted_keys(keys: &[(Duration, u8)], now: Duration, hold: Duration) -> Vec<u8> {
         let mut down = Vec::new();
         for &(at, vk) in keys {
-            if now.checked_sub(at).is_some_and(|age| age < Duration::from_millis(200))
-                && !down.contains(&vk)
-            {
+            if now.checked_sub(at).is_some_and(|age| age < hold) && !down.contains(&vk) {
                 down.push(vk);
             }
         }
@@ -1957,10 +1968,11 @@ mod host {
     fn overlapping_scripted_presses_hold_one_key_until_both_end() {
         let ms = Duration::from_millis;
         let keys = [(ms(0), b'W'), (ms(50), b'A'), (ms(100), b'W')];
-        assert_eq!(active_scripted_keys(&keys, ms(100)), b"WA");
-        assert_eq!(active_scripted_keys(&keys, ms(249)).len(), 2);
-        assert_eq!(active_scripted_keys(&keys, ms(250)), b"W");
-        assert!(active_scripted_keys(&keys, ms(300)).is_empty());
+        assert_eq!(active_scripted_keys(&keys, ms(100), ms(200)), b"WA");
+        assert_eq!(active_scripted_keys(&keys, ms(249), ms(200)).len(), 2);
+        assert_eq!(active_scripted_keys(&keys, ms(250), ms(200)), b"W");
+        assert!(active_scripted_keys(&keys, ms(300), ms(200)).is_empty());
+        assert_eq!(active_scripted_keys(&keys, ms(500), ms(600)), b"WA");
     }
 
     /// Debugging aid: `VICTORY_KBM_SCRIPT=<seconds>:<key>[*<hold seconds>],...`
