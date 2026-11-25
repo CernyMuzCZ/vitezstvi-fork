@@ -6,9 +6,13 @@
 //! * [`logging`]: one tracing setup for all binaries.
 
 pub mod config;
+pub mod env;
+pub mod fastboot;
 #[cfg(windows)]
 pub mod fence_watch;
+pub mod kbm;
 pub mod logging;
+pub mod pace;
 pub mod policy;
 
 pub use config::Config;

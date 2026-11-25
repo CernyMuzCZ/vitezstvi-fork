@@ -656,6 +656,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "toml",
+ "tracing",
  "tracing-subscriber",
  "windows-sys",
 ]
@@ -696,6 +697,7 @@ dependencies = [
  "opus-pure",
  "tempfile",
  "tracing",
+ "victory-core",
  "victory-formats",
  "victory-gpu",
  "victory-loader",

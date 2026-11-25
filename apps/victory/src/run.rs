@@ -28,6 +28,9 @@ pub fn run(
         },
     });
     victory_hle::modules::xmem::register_page_gen_oracle();
+    // Keyboard and mouse as a pad (`VICTORY_KBM=0`: the old stand-in keys;
+    // `VICTORY_MOUSE_SENS`, `VICTORY_MOUSE_INVERT_Y`, `VICTORY_KEYMAP`).
+    victory_hle::modules::controls::configure(None).map_err(anyhow::Error::msg)?;
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let mut prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
