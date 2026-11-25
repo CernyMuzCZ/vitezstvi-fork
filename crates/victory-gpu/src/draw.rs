@@ -3102,6 +3102,53 @@ impl State {
                 fresh.push(u.slot);
             }
         }
+        for index in indexed {
+            if fresh.contains(&index.table_slot) {
+                continue;
+            }
+            let Some(&Root::Table(table)) =
+                self.roots_ref(compute).get(usize::from(index.table_slot))
+            else {
+                continue;
+            };
+            let Some(heap) = self.heap_of(table) else {
+                continue;
+            };
+            let Some(host) = heap.host() else {
+                continue;
+            };
+            let constant = self.user_value(
+                compute,
+                index.constant_slot,
+                RootType::Constants,
+                index.constant_dword,
+            );
+            let offset = index.byte_offset.wrapping_add(constant << index.shift) / 32;
+            let Some(end) = table.checked_add(u64::from(offset) * 32) else {
+                continue;
+            };
+            if heap.index(end).is_some_and(|i| i >= host.count()) {
+                fresh.push(index.table_slot);
+            }
+        }
+        for &(slot, at) in half {
+            if fresh.contains(&slot) {
+                continue;
+            }
+            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
+                continue;
+            };
+            let Some(heap) = self.heap_of(table) else {
+                continue;
+            };
+            let Some(host) = heap.host() else {
+                continue;
+            };
+            let end = table + u64::from(at) * 4;
+            if heap.index(end).is_some_and(|i| i >= host.count()) {
+                fresh.push(slot);
+            }
+        }
         fresh.sort_unstable();
         fresh.dedup();
         for u in used.iter().filter(tables) {
@@ -3213,7 +3260,9 @@ impl State {
                 .push((std::ptr::from_ref(heap) as usize, first, n));
             // The title's own slots of this table: what the draw reads of
             // them it brings up to date here, in the dynamic slots.
-            let title_first = heap.index(table).filter(|first| first + n <= host.count());
+            let title_first = heap
+                .index(table)
+                .filter(|&first| first.checked_add(n).is_some_and(|end| end <= host.mirrored_count()));
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {

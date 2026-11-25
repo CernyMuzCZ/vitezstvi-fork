@@ -1046,17 +1046,20 @@ impl HostHeap {
         if !sampler && TEST_MAP.get().is_none() {
             probe_view_limit();
         }
-        let layout = (!sampler)
-            .then(heap_map)
-            .flatten()
+        let active_map = (!sampler).then(heap_map).flatten();
+        let layout = active_map
             .filter(|&(window, _)| count > window)
             .map(|(window, slot)| MapLayout::new(count, window, slot));
+        let unmapped_map_slot = layout
+            .is_none()
+            .then_some(active_map.map(|(_, slot)| slot))
+            .flatten();
         let null = if sampler {
             0
         } else {
             victory_shader::emit::view_heap_limit()
         };
-        let (heap, count, size) = if let Some(l) = layout {
+        let (heap, count, size, dynamic_override) = if let Some(l) = layout {
             tracing::info!(
                 count,
                 window = l.window,
@@ -1065,15 +1068,24 @@ impl HostHeap {
                 "host view heap with a heap map: title slots past the window that hold views get pool slots"
             );
             match make(l.size()) {
-                Ok(heap) => (heap, l.window, l.size()),
+                Ok(heap) => (heap, l.window, l.size(), None),
                 Err(e) => {
                     tracing::warn!(error = %e, count, "no host view heap with a heap map");
                     return None;
                 }
             }
         } else if null == 0 {
-            match make(count + extra) {
-                Ok(heap) => (heap, count, count + extra),
+            let dyn_first = match unmapped_map_slot {
+                Some(slot) if count + extra > slot => Some(slot + 1),
+                _ => None,
+            };
+            let need = dyn_first.unwrap_or(count) + extra;
+            let size = match unmapped_map_slot {
+                Some(slot) => need.max(slot + 1),
+                None => need,
+            };
+            match make(size) {
+                Ok(heap) => (heap, count, size, dyn_first),
                 Err(e) => {
                     tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
                     return None;
@@ -1089,8 +1101,12 @@ impl HostHeap {
                 tracing::warn!(count, "host view heap capped at {size}; views past it read a null slot");
                 null - extra
             };
+            let dyn_first = match unmapped_map_slot {
+                Some(slot) if fitted + extra > slot && slot + 1 + extra <= null => Some(slot + 1),
+                _ => None,
+            };
             match make(size) {
-                Ok(heap) => (heap, fitted, size),
+                Ok(heap) => (heap, fitted, size, dyn_first),
                 Err(e) => {
                     tracing::warn!(error = %e, count, size, "no host view heap");
                     return None;
@@ -1152,7 +1168,7 @@ impl HostHeap {
             .flatten();
         let (pool, dynamic_first, titled) = match layout {
             Some(l) => (l.pool, l.dynamic_first(), title_count),
-            None => (0, count, count),
+            None => (0, dynamic_override.unwrap_or(count), count),
         };
         let h = HostHeap {
             heap,
@@ -1210,6 +1226,13 @@ impl HostHeap {
                 Some(m) => h.raw_at(l.slot, &m.buffer, 0, u64::from(title_count - l.window) * 4),
                 None => h.null_raw_at(l.slot),
             }
+        } else if let Some(slot) = unmapped_map_slot
+            && slot < size
+        {
+            // Shaders compiled with a heap map still load the map slot before
+            // selecting on `index >= window`; keep a raw buffer null view there
+            // even on heaps that fit inside the identity window.
+            h.null_raw_at(slot);
         }
         Some(h)
     }
@@ -1391,42 +1414,51 @@ impl HostHeap {
         unsafe { (m.at as *mut u32).add(i as usize).write_volatile(map.entry(title)) };
     }
 
-    /// Gives back title slot `title`'s pool slot (`made` locked), if it has one.
-    fn unmap(&self, made: &mut Made, title: u32) {
+    /// Gives back title slot `title`'s pool slot (`made` locked), if it has one,
+    /// returning the released host pool slot.
+    fn unmap(&self, made: &mut Made, title: u32) -> Option<u32> {
         let (Some(map), Some(m)) = (made.map.as_mut(), &self.map) else {
-            return;
+            return None;
         };
-        let Some(host) = map.host(title).filter(|_| title >= map.window()) else {
-            return;
-        };
+        let host = map.host(title).filter(|_| title >= map.window())?;
         let i = title - map.window();
         // SAFETY: entry `i` of the mapped heap map (`title` is mapped).
         unsafe { (m.at as *mut u32).add(i as usize).write_volatile(0) };
         std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
         map.free(title, crate::host::submissions().0);
         made.keys[host as usize] = 0;
+        Some(host)
     }
 
     /// Title slot `title` holds no view (`made` locked).
     fn empty_slot(&self, made: &mut Made, title: u32, for_draw: bool) {
-        match made.host(title) {
-            Some(host) if made.keys[host as usize] != 0 => {
-                made.keys[host as usize] = 0;
-                self.make_null(host);
+        if title >= self.count {
+            // Mapped pool slot: unmap and quarantine first without clobbering
+            // `self.cpu(host)` so any in-flight GPU submission reading `host`
+            // keeps a valid descriptor until reuse overwrites it after the
+            // submission finishes.
+            if let Some(host) = self.unmap(made, title) {
+                self.keep(host, None);
+                let _ = self.note_buffer(title, None, false);
+            } else if for_draw {
                 let _ = self.note_buffer(title, None, false);
             }
-            _ if for_draw => {
-                let _ = self.note_buffer(title, None, false);
-            }
-            _ => {}
+            return;
         }
-        self.unmap(made, title);
+        if made.keys[title as usize] != 0 {
+            made.keys[title as usize] = 0;
+            self.make_null(title);
+            let _ = self.note_buffer(title, None, false);
+        } else if for_draw {
+            let _ = self.note_buffer(title, None, false);
+        }
     }
 
     /// Reclaims pool slots of title slots whose view is no longer live.
     fn reclaim(&self, made: &mut Made) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
         const EVERY_MS: u64 = 2000;
+        const PAGE: u64 = 4096;
         let now = crate::host::now_ms();
         let last = self.reclaimed.load(Relaxed);
         if last != u64::MAX && now < last.saturating_add(EVERY_MS) {
@@ -1438,13 +1470,40 @@ impl HostHeap {
             return 0;
         };
         let started = std::time::Instant::now();
+        // Title heap pages can be unmapped/decommitted by the title; read each
+        // 4 KiB page safely through `host::read_into` (cached across ascending
+        // title slots) and treat unreadable pages as dead slots.
+        let mut page_addr = u64::MAX;
+        let mut page_ok = false;
+        let mut page = [0u8; PAGE as usize];
+        let mut slot_bytes = [0u8; 12];
         let dead: Vec<u32> = map
             .mapped()
             .map(|(title, _)| title)
             .filter(|&title| {
                 let handle = start + u64::from(title) * TITLE_SLOT_BYTES;
-                // SAFETY: `title < title_count`, a slot of the live title heap.
-                let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+                let base = handle & !(PAGE - 1);
+                let off = (handle - base) as usize;
+                let ok = if off + 12 <= page.len() {
+                    if base != page_addr {
+                        page_addr = base;
+                        page_ok = crate::host::read_into(base as *const u8, &mut page);
+                    }
+                    if page_ok {
+                        slot_bytes.copy_from_slice(&page[off..off + 12]);
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    crate::host::read_into(handle as *const u8, &mut slot_bytes)
+                };
+                if !ok {
+                    return true;
+                }
+                let tag = u32::from_ne_bytes([slot_bytes[0], slot_bytes[1], slot_bytes[2], slot_bytes[3]]);
+                let i = u32::from_ne_bytes([slot_bytes[4], slot_bytes[5], slot_bytes[6], slot_bytes[7]]);
+                let generation = u32::from_ne_bytes([slot_bytes[8], slot_bytes[9], slot_bytes[10], slot_bytes[11]]);
                 tag != VIEW_TAG || view_at(i, generation).is_none()
             })
             .collect();
@@ -2287,9 +2346,15 @@ impl HostHeap {
             return false;
         }
         PUBLISHING.set(true);
-        let shown = self.mirror(index, handle, true).is_some();
+        let view = self.mirror(index, handle, true);
         PUBLISHING.set(false);
-        shown
+        view.is_some()
+            && self
+                .made
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .host(index)
+                .is_some()
     }
 
     /// Makes title slot `index`'s host slot (its own, or with a heap map
@@ -2301,11 +2366,11 @@ impl HostHeap {
         let mirrored = self.mirrored_count();
         if index >= mirrored {
             static HIGHEST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            let past = index - self.count + 1;
+            let past = index - mirrored + 1;
             if HIGHEST.fetch_max(index, std::sync::atomic::Ordering::Relaxed) < index && past.is_power_of_two() {
                 tracing::warn!(
                     index,
-                    count = self.count,
+                    count = mirrored,
                     for_draw,
                     "title slot past the host heap"
                 );
@@ -4544,6 +4609,348 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    struct TestMapGuard(Option<(u32, u32)>);
+
+    impl TestMapGuard {
+        fn set(map: (u32, u32)) -> Self {
+            TestMapGuard(TEST_MAP.replace(Some(map)))
+        }
+    }
+
+    impl Drop for TestMapGuard {
+        fn drop(&mut self) {
+            TEST_MAP.set(self.0);
+        }
+    }
+
+    /// `MapLayout` arithmetic across the real 1,000,000-slot Tier 2 layout and
+    /// edge cases (no GPU needed).
+    #[test]
+    fn map_layout_arithmetic_and_boundaries() {
+        let full = MapLayout::new(1_245_184, WINDOW, MAP_SLOT);
+        assert_eq!(full.window, 131_072);
+        assert_eq!(full.slot, 737_854);
+        assert_eq!(full.pool, MAP_SLOT - WINDOW);
+        assert_eq!(full.window + full.pool, MAP_SLOT);
+        assert_eq!(full.dynamic_first(), MAP_SLOT + 1);
+        assert_eq!(full.guard(), PORTABLE_VIEWS - 1);
+        assert_eq!(full.size(), PORTABLE_VIEWS);
+
+        // Title heap smaller than MAP_SLOT: pool shrinks to title_count - window.
+        let smaller = MapLayout::new(200_000, WINDOW, MAP_SLOT);
+        assert_eq!(smaller.window, WINDOW);
+        assert_eq!(smaller.pool, 200_000 - WINDOW);
+        assert!(smaller.window + smaller.pool < MAP_SLOT);
+        assert_eq!(smaller.size(), PORTABLE_VIEWS);
+
+        // Window equal to MAP_SLOT: zero pool, map slot stays disjoint from dynamic.
+        let no_pool = MapLayout::new(1_245_184, MAP_SLOT, MAP_SLOT);
+        assert_eq!(no_pool.window, MAP_SLOT);
+        assert_eq!(no_pool.pool, 0);
+        assert_eq!(no_pool.dynamic_first(), MAP_SLOT + 1);
+        assert_eq!(no_pool.size(), PORTABLE_VIEWS);
+
+        // Window equal to zero: entire 0..MAP_SLOT range is pool.
+        let all_mapped = MapLayout::new(1_245_184, 0, MAP_SLOT);
+        assert_eq!(all_mapped.window, 0);
+        assert_eq!(all_mapped.pool, MAP_SLOT);
+        assert_eq!(all_mapped.size(), PORTABLE_VIEWS);
+
+        // Title count <= window or window > slot: clamped without underflow.
+        let clamped_count = MapLayout::new(64, WINDOW, MAP_SLOT);
+        assert_eq!(clamped_count.window, 64);
+        assert_eq!(clamped_count.pool, 0);
+        let clamped_window = MapLayout::new(1_245_184, MAP_SLOT + 100, MAP_SLOT);
+        assert_eq!(clamped_window.window, MAP_SLOT);
+        assert_eq!(clamped_window.pool, 0);
+    }
+
+    /// `publish_slot` on a title slot past the window makes and publishes its
+    /// pool slot; when the pool is exhausted, `publish_slot` reports false and
+    /// leaves the map entry 0 (so shaders clamp to the guard slot).
+    #[test]
+    fn publish_slot_past_window_makes_pool_slot_and_reports_pool_exhaustion() {
+        let _guard = TestMapGuard::set((16, 18)); // window = 16, map_slot = 18, pool = 2
+        let Some(heap) = HostHeap::new(false, 32) else {
+            return; // no host GPU
+        };
+        assert_eq!(heap.count(), 16);
+        assert_eq!(heap.mirrored_count(), 32);
+        let view = |at: u64| {
+            let mut desc = [0u32; 16];
+            (desc[0], desc[1], desc[2], desc[5]) = (98, 4, 5768, 1);
+            (desc[10], desc[11]) = (at as u32, (at >> 32) as u32);
+            View::Placed(false, [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0], desc)
+        };
+        // 32 title slots, 32 bytes each.
+        let title_mem = vec![0u32; 32 * 8];
+        let slot_handle = |i: u32| title_mem.as_ptr() as u64 + u64::from(i) * TITLE_SLOT_BYTES;
+        let map_entry = |i: u32| -> u32 {
+            let m = heap.map.as_ref().expect("heap map buffer");
+            // SAFETY: inside the mapped heap map buffer for `16..32`.
+            unsafe { (m.at as *const u32).add((i - 16) as usize).read_volatile() }
+        };
+
+        // Slot 16 (exact WINDOW) and slot 17 take the two pool slots.
+        for (slot, addr) in [(16u32, 0x7fe1_0000_0000u64), (17u32, 0x7fe2_0000_0000u64)] {
+            let handle = slot_handle(slot);
+            crate::descriptor::record(handle, view(addr));
+            let (_, key) = crate::descriptor::view_and_key(handle).unwrap();
+            assert!(heap.publish_slot(slot, handle, key), "slot {slot} published");
+            assert!(heap.made(slot), "slot {slot} made");
+            let raw = map_entry(slot);
+            assert_ne!(raw, 0, "slot {slot} map entry published");
+            let host_slot = super::super::slot_map::decode(raw).unwrap();
+            assert!((16..18).contains(&host_slot), "pool slot {host_slot} inside 16..18");
+        }
+
+        // Pool is now full (2/2 live views). Slot 18 (exact MAP_SLOT) must be
+        // refused, leave map entry 0 (clamping to guard slot < 1,000,000), and
+        // report `false` from `publish_slot`.
+        let handle18 = slot_handle(18);
+        crate::descriptor::record(handle18, view(0x7fe3_0000_0000));
+        let (_, key18) = crate::descriptor::view_and_key(handle18).unwrap();
+        assert!(!heap.publish_slot(18, handle18, key18), "exhausted pool must report not shown");
+        assert!(!heap.made(18));
+        assert_eq!(map_entry(18), 0);
+    }
+
+    /// Clearing a mapped title slot that was mirrored with `for_draw = false`
+    /// (so `made.keys[host] == 0`) must unmap it AND clear its texture/buffer
+    /// tracking so it does not leak in the bindless queue.
+    #[test]
+    fn empty_slot_on_unmade_mapped_slot_clears_texture_queue() {
+        let _guard = TestMapGuard::set((16, 20));
+        let Some(heap) = HostHeap::new(false, 32) else {
+            return; // no host GPU
+        };
+        let mut title_mem = vec![0u32; 32 * 8];
+        let slot_handle = |mem: &[u32], i: u32| mem.as_ptr() as u64 + u64::from(i) * TITLE_SLOT_BYTES;
+        let mut desc = [0u32; 16];
+        let at = 0x7fe4_0000_0000u64;
+        (desc[0], desc[1], desc[2], desc[5]) = (98, 4, 5768, 1);
+        (desc[10], desc[11]) = (at as u32, (at >> 32) as u32);
+        let view = View::Placed(false, [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0], desc);
+
+        let h16 = slot_handle(&title_mem, 16);
+        crate::descriptor::record(h16, view);
+        assert!(heap.mirror(16, h16, false).is_some());
+        assert!(heap.texture_slots_due(u64::MAX, 32).0.iter().any(|&(s, _)| s == 16));
+
+        // Clear slot 16 to zeros and mirror with for_draw = false (as sync_heaps does).
+        title_mem[16 * 8..16 * 8 + 8].fill(0);
+        assert!(heap.mirror(16, h16, false).is_none());
+        let m = heap.map.as_ref().unwrap();
+        // SAFETY: slot 16 is index 0 of the map buffer.
+        assert_eq!(unsafe { (m.at as *const u32).read_volatile() }, 0);
+        assert!(
+            !heap.texture_slots_due(u64::MAX, 32).0.iter().any(|&(s, _)| s == 16),
+            "cleared mapped slot must leave the texture queue"
+        );
+    }
+
+    /// A view heap with `count <= window` on a heap-mapped host must never
+    /// place dynamic descriptors on top of `MAP_SLOT`, because shaders read
+    /// `ResourceDescriptorHeap[MAP_SLOT]` unconditionally in `heap_remap`.
+    #[test]
+    fn small_view_heap_below_window_avoids_map_slot_collision() {
+        let _guard = TestMapGuard::set((16, 48));
+        let Some(heap) = HostHeap::new(false, 16) else {
+            return; // no host GPU
+        };
+        let first_dyn = heap.dynamic(1).expect("a dynamic slot");
+        heap.release(first_dyn, 1);
+        assert!(
+            first_dyn > 48 || first_dyn + heap.dynamic <= 48,
+            "dynamic range {first_dyn}..{} overlaps MAP_SLOT 48",
+            first_dyn + heap.dynamic
+        );
+    }
+
+    /// Unmapping a mapped pool slot (`empty_slot`) must zero its map entry,
+    /// quarantine its pool slot, and retire its kept resource WITHOUT
+    /// overwriting the live GPU descriptor in-place while an in-flight
+    /// submission may still reference `host_slot`. Once reused after the
+    /// submission finishes, the pool slot is overwritten with the new view
+    /// before being published.
+    #[test]
+    fn empty_slot_on_mapped_slot_preserves_live_descriptor_until_reuse() {
+        const SHADER: &str = "#define RS \"DescriptorTable(SRV(t0)), UAV(u0)\"\n\
+            ByteAddressBuffer src : register(t0);\n\
+            RWByteAddressBuffer dst : register(u0);\n\
+            [RootSignature(RS)]\n\
+            [numthreads(1, 1, 1)]\n\
+            void main() { dst.Store(0, src.Load(0)); }\n";
+        let Some(gpu) = host() else {
+            return;
+        };
+        let _guard = TestMapGuard::set((16, 17)); // window = 16, map_slot = 17, pool = 1
+        let Some(heap) = HostHeap::new(false, 32) else {
+            return;
+        };
+        let mut title_mem = vec![0u32; 32 * 8];
+        let slot_handle = |mem: &[u32], i: u32| mem.as_ptr() as u64 + u64::from(i) * TITLE_SLOT_BYTES;
+        let map_entry = |i: u32| -> u32 {
+            let m = heap.map.as_ref().unwrap();
+            // SAFETY: inside mapped heap map for `16..32`.
+            unsafe { (m.at as *const u32).add((i - 16) as usize).read_volatile() }
+        };
+
+        let buf_a = [0x1234_5678u32; 16];
+        let buf_b = [0xCAFE_BABEu32; 16];
+        let addr_a = buf_a.as_ptr() as u64;
+        let addr_b = buf_b.as_ptr() as u64;
+        let shadow_a = crate::shadow::find(addr_a, 64).expect("shadow A");
+        let shadow_b = crate::shadow::find(addr_b, 64).expect("shadow B");
+        let raw_view = |addr: u64| {
+            let resource = [1, 0, 0, 0, 64, 0, 1, 0x1_0001, 0, 1, 0, 1, 0, 0];
+            let mut desc = [0u32; 16];
+            // DXGI_FORMAT_R32_TYPELESS (39), D3D12_SRV_DIMENSION_BUFFER (1), default mapping,
+            // FirstElement = 0, NumElements = 16, StructureByteStride = 0, Flags = RAW (1).
+            desc[..10].copy_from_slice(&[39, 1, 5768, 0, 0, 0, 16, 0, 1, 0]);
+            (desc[10], desc[11]) = (addr as u32, (addr >> 32) as u32);
+            View::Placed(false, resource, desc)
+        };
+
+        // Upload both title buffers into their host copies.
+        let list = gpu.new_list().expect("list");
+        shadow_a.refresh(&list, addr_a, 64);
+        shadow_b.refresh(&list, addr_b, 64);
+        list.close();
+        gpu.execute(&[&list]);
+
+        let code = crate::host::compile(SHADER, windows::core::s!("main"), windows::core::s!("cs_5_1"))
+            .expect("shader compiles");
+        let (out_buf, out_ptr) = gpu.shared_buffer(64).expect("out buffer");
+        // SAFETY: valid compiled bytecode with embedded root signature.
+        let (root, pso): (ID3D12RootSignature, ID3D12PipelineState) = unsafe {
+            let root: ID3D12RootSignature = gpu.device.CreateRootSignature(0, &code).unwrap();
+            let pso = gpu
+                .device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: code.as_ptr().cast(),
+                        BytecodeLength: code.len(),
+                    },
+                    ..Default::default()
+                })
+                .unwrap();
+            (root, pso)
+        };
+        let read_host_slot = |host_slot: u32| -> u32 {
+            // SAFETY: open list, live heap/PSO/buffers.
+            unsafe {
+                (out_ptr as *mut u32).write_volatile(0);
+                let l = gpu.new_list().unwrap();
+                l.list.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
+                l.list.SetComputeRootSignature(&root);
+                l.list.SetPipelineState(&pso);
+                l.list.SetComputeRootDescriptorTable(0, heap.gpu_handle(host_slot));
+                l.list.SetComputeRootUnorderedAccessView(1, out_buf.GetGPUVirtualAddress());
+                l.list.Dispatch(1, 1, 1);
+                l.close();
+                gpu.execute(&[&l]);
+                (out_ptr as *const u32).read_volatile()
+            }
+        };
+
+        // 1. Map title slot 16 -> pool slot 16 with buffer A.
+        let h16 = slot_handle(&title_mem, 16);
+        crate::descriptor::record(h16, raw_view(addr_a));
+        assert!(heap.mirror(16, h16, true).is_some());
+        let host_slot = super::super::slot_map::decode(map_entry(16)).expect("slot 16 mapped");
+        assert_eq!(host_slot, 16);
+        assert_eq!(read_host_slot(host_slot), 0x1234_5678);
+
+        // 2. Clear title slot 16 (triggers empty_slot -> unmap).
+        // Map entry must be 0, kept resource retired, AND the descriptor at
+        // `host_slot` must remain intact (not clobbered with Texture2D null_view)
+        // while an in-flight submission may still read it!
+        title_mem[16 * 8..16 * 8 + 8].fill(0);
+        assert!(heap.mirror(16, h16, true).is_none());
+        assert_eq!(map_entry(16), 0);
+        assert!(!heap.made(16));
+        assert!(heap.kept.lock().unwrap()[host_slot as usize].is_none());
+        // Keep `shadow_a` alive (simulating retirement holding it while in flight).
+        assert_eq!(
+            read_host_slot(host_slot),
+            0x1234_5678,
+            "empty_slot must not clobber a quarantined pool descriptor while in flight"
+        );
+        drop(shadow_a);
+
+        // 3. Reassign the released pool slot to title slot 17 with buffer B:
+        //    pool slot must be cleanly overwritten before publishing slot 17.
+        let h17 = slot_handle(&title_mem, 17);
+        crate::descriptor::record(h17, raw_view(addr_b));
+        assert!(heap.mirror(17, h17, true).is_some());
+        assert_eq!(super::super::slot_map::decode(map_entry(17)), Some(host_slot));
+        assert_eq!(read_host_slot(host_slot), 0xCAFE_BABE);
+        drop(shadow_b);
+    }
+
+    /// `reclaim` must safely skip/reclaim mapped slots on decommitted pages of
+    /// a placed descriptor heap without faulting with an access violation.
+    #[test]
+    fn reclaim_handles_unmapped_placed_heap_pages_without_faulting() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree,
+        };
+        let _guard = TestMapGuard::set((16, 18)); // window = 16, map_slot = 18, pool = 2
+        let Some(heap) = HostHeap::new(false, 256) else {
+            return; // no host GPU
+        };
+        // Reserve 2 pages (8 KiB = 256 title slots of 32 bytes), commit both.
+        // SAFETY: plain VirtualAlloc of our own test memory.
+        let base = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                8192,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        };
+        assert!(!base.is_null());
+        let handle = |i: u32| base as u64 + u64::from(i) * TITLE_SLOT_BYTES;
+        let view = |at: u64| {
+            let mut desc = [0u32; 16];
+            (desc[0], desc[1], desc[2], desc[5]) = (98, 4, 5768, 1);
+            (desc[10], desc[11]) = (at as u32, (at >> 32) as u32);
+            View::Placed(false, [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0], desc)
+        };
+
+        // Fill the 2 pool slots: slot 16 (page 0) and slot 144 (page 1, offset 4608).
+        crate::descriptor::record(handle(16), view(0x7fe6_0000_0000));
+        crate::descriptor::record(handle(144), view(0x7fe7_0000_0000));
+        assert!(heap.mirror(16, handle(16), false).is_some());
+        assert!(heap.mirror(144, handle(144), false).is_some());
+
+        // Decommit page 1 (simulating the title unmapping a placed heap page).
+        // SAFETY: page 1 of our test allocation.
+        let ok = unsafe { VirtualFree(base.cast::<u8>().add(4096).cast(), 4096, MEM_DECOMMIT) };
+        assert_ne!(ok, 0);
+
+        // Mirror slot 17 (page 0): pool is full -> triggers `reclaim`.
+        // Must NOT access-violate on page 1; must reclaim slot 144 and map slot 17!
+        crate::descriptor::record(handle(17), view(0x7fe8_0000_0000));
+        assert!(heap.mirror(17, handle(17), false).is_some());
+        let m = heap.map.as_ref().unwrap();
+        // SAFETY: entries 1 (slot 17) and 128 (slot 144) inside the map buffer.
+        let (e17, e144) = unsafe {
+            (
+                (m.at as *const u32).add(1).read_volatile(),
+                (m.at as *const u32).add(144 - 16).read_volatile(),
+            )
+        };
+        assert_ne!(e17, 0, "slot 17 received the reclaimed pool slot");
+        assert_eq!(e144, 0, "unmapped page's slot 144 was reclaimed");
+
+        // SAFETY: release our test allocation.
+        unsafe { VirtualFree(base, 0, MEM_RELEASE) };
     }
 }
 

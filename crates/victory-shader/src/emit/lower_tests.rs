@@ -780,3 +780,123 @@ fn cube_image_get_lod_lowers_and_validates() {
     #[cfg(not(windows))]
     let _ = lowered;
 }
+
+/// With a heap map enabled, only views loaded from `RootType::ResourceHeap`
+/// emit `heap_remap`; `RootType::Table` and `RootType::SamplerHeap` stay
+/// byte-for-byte identical to the unmapped translation, and `view_heap_limit`
+/// clamps every heap view handle (including under `TEST_VIEW_HEAP`).
+#[test]
+fn heap_map_remaps_only_resource_heap_views_and_clamps_to_limit() {
+    use super::super::shader::TEST_VIEW_HEAP;
+
+    struct Reset(Option<(u32, Option<(u32, u32)>)>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_VIEW_HEAP.set(self.0);
+        }
+    }
+
+    // Load a 4-dword raw buffer descriptor from s[0:1] (s0 = base offset, s1 = 0),
+    // load one dword, and store to LDS so the read stays live.
+    let buf_words = [
+        0xBE84_0300u32, // s_mov_b32 s4, s0
+        0xBE85_0380,    // s_mov_b32 s5, 0
+        0xF408_0202,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+        0xE030_0000,
+        0x8002_0100, // buffer_load_dword v1, off, s[8:11], 0
+        0xD834_0000,
+        0x0000_0100, // ds_write_b32 v0, v1
+        S_ENDPGM,
+    ];
+    let lower_root = |root_type: RootType, cfg: (u32, Option<(u32, u32)>)| -> Vec<u8> {
+        let _r = Reset(TEST_VIEW_HEAP.replace(Some(cfg)));
+        let used = if root_type == RootType::Table {
+            vec![UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            }]
+        } else {
+            vec![]
+        };
+        let lowered = lower_with(&buf_words, vec![root(root_type, 0, 0)], used).unwrap();
+        #[cfg(windows)]
+        if let Ok(mut v) = crate::emit::validator::Validator::load(
+            crate::emit::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut lowered.dxil.clone())
+                .unwrap_or_else(|e| panic!("DXIL validation failed for {root_type:?} {cfg:?}: {e}"));
+        }
+        lowered.dxil
+    };
+
+    const LIMIT: u32 = 999_999;
+    const MAP: (u32, u32) = (131_072, 737_854);
+
+    // 1. Table views must NOT go through the heap map: DXIL with map == DXIL without map.
+    let table_unmapped = lower_root(RootType::Table, (LIMIT, None));
+    let table_mapped = lower_root(RootType::Table, (LIMIT, Some(MAP)));
+    assert_eq!(
+        table_unmapped, table_mapped,
+        "RootType::Table must use table slots directly without heap_remap"
+    );
+
+    // 2. ResourceHeap views MUST go through heap_remap: DXIL differs when mapped.
+    let heap_unmapped = lower_root(RootType::ResourceHeap, (LIMIT, None));
+    let heap_mapped = lower_root(RootType::ResourceHeap, (LIMIT, Some(MAP)));
+    assert_ne!(
+        heap_unmapped, heap_mapped,
+        "RootType::ResourceHeap must emit heap_remap when a heap map is active"
+    );
+
+    // 3. `view_heap_limit()` must clamp handles under `TEST_VIEW_HEAP` too:
+    //    limit = 999_999 must emit different DXIL than limit = 0 (unclamped).
+    let table_unclamped = lower_root(RootType::Table, (0, None));
+    assert_ne!(
+        table_unmapped, table_unclamped,
+        "heap_handle must read view_heap_limit() so TEST_VIEW_HEAP clamps indices"
+    );
+
+    // 4. SamplerHeap samplers must NOT go through heap_remap (a table texture
+    //    sampled with a sampler loaded from SamplerHeap stays byte-for-byte
+    //    identical with or without a view heap map).
+    // image_sample_lz (op 0x27, dim=1 2D, dmask=1)
+    let mimg_w0 = 0xF000_0000 | (0x27 << 18) | (1 << 8) | (1 << 3);
+    let sampler_words = [
+        0xBE84_0300u32, // s_mov_b32 s4, s0 (table)
+        0xBE85_0380,    // s_mov_b32 s5, 0
+        0xBE86_0301,    // s_mov_b32 s6, s1 (sampler heap)
+        0xBE87_0380,    // s_mov_b32 s7, 0
+        0xF40C_0202,
+        0xFA00_0000, // s_load_dwordx8 s[8:15], s[4:5], null
+        0xF408_0403,
+        0xFA00_0000, // s_load_dwordx4 s[16:19], s[6:7], null
+        0x7E00_0280,
+        0x7E02_0280,
+        0x7E04_0280,
+        mimg_w0,
+        0x0082_0000, // srsrc = 2 (s[8:15]), ssamp = 4 (s[16:19])
+        0xD834_0000,
+        0x0000_0000, // ds_write_b32 v0, v0
+        S_ENDPGM,
+    ];
+    let lower_sampler = |cfg: (u32, Option<(u32, u32)>)| -> Vec<u8> {
+        let _r = Reset(TEST_VIEW_HEAP.replace(Some(cfg)));
+        let layout = vec![
+            root(RootType::Table, 0, 0),
+            root(RootType::SamplerHeap, 1, 1),
+        ];
+        lower_with(&sampler_words, layout, vec![]).unwrap().dxil
+    };
+    assert_eq!(
+        lower_sampler((LIMIT, None)),
+        lower_sampler((LIMIT, Some(MAP))),
+        "SamplerHeap must never go through the view heap map"
+    );
+}

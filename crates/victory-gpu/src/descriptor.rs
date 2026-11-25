@@ -1361,6 +1361,120 @@ mod tests {
         );
     }
 
+    /// Tables at or past the heap map's identity window (including WINDOW,
+    /// MAP_SLOT - 1, MAP_SLOT, and tables starting below WINDOW whose indexed
+    /// views cross WINDOW) are made afresh in dynamic slots; texture views
+    /// read through such tables leave the bindless texture queue and mirror
+    /// their pool slots.
+    #[cfg(windows)]
+    #[test]
+    fn tables_past_the_heap_maps_window_are_made_afresh() {
+        use victory_shader::resource::RootIndexedView;
+        use victory_shader::{ResourceType, RootType, UsedResource};
+        let Some(device) = crate::host::host() else {
+            return; // no host GPU
+        };
+        struct Reset(Option<(u32, u32)>);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                host::TEST_MAP.set(self.0);
+            }
+        }
+        // window = 16, map_slot = 48, title_count = 64 -> dynamic_first = 49
+        let _reset = Reset(host::TEST_MAP.replace(Some((16, 48))));
+        let list = device.new_list().expect("a host list");
+        let desc = HeapDesc {
+            kind: VIEWS_KIND,
+            count: 64,
+            flags: SHADER_VISIBLE,
+            nodes: 1,
+        };
+        let none = Placement { address: 0, size: 0 };
+        let mut h: This = std::ptr::null();
+        assert_eq!(create(desc, none, &mut h), S_OK);
+        let title = heap(h);
+        let host_heap = title.host().expect("a host view heap with a heap map");
+        assert_eq!(host_heap.count(), 16);
+        assert_eq!(host_heap.mirrored_count(), 64);
+
+        // Placed 64x64 BC7 texture view at unique addresses.
+        let put_texture = |slot_idx: u32, addr: u64| {
+            let resource = [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0];
+            let mut words = [0u32; 16];
+            (words[0], words[1], words[2], words[5]) = (98, 4, 5768, 1);
+            (words[10], words[11]) = (addr as u32, (addr >> 32) as u32);
+            create_placed_srv(std::ptr::null(), &resource, &words, title.handle(slot_idx).unwrap());
+        };
+        for (k, slot_idx) in [15u32, 16, 20, 47, 48].into_iter().enumerate() {
+            put_texture(slot_idx, 0x7fe5_0000_0000 + (k as u64) * 0x10_0000);
+        }
+        // Slot 20 was queued when written with for_draw = false.
+        assert!(host_heap.texture_slots_due(u64::MAX, 64).0.iter().any(|&(s, _)| s == 20));
+        assert!(!host_heap.made(20));
+
+        let range = UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 8,
+            user_data: 0,
+            slot: 1,
+        };
+        let mut state = crate::draw::State::default();
+        state.set_heaps(&[h]);
+
+        // Tables at WINDOW (16), past WINDOW (20), MAP_SLOT - 1 (47), and
+        // MAP_SLOT (48) must all be made afresh in dynamic slots (>= 49).
+        for slot_idx in [16u32, 20, 47, 48] {
+            state.set_table(true, 1, title.handle(slot_idx).unwrap());
+            let made = state.tables(&list, &[range], &[], &[], true);
+            let [(1, offset)] = made[..] else {
+                panic!("table at slot {slot_idx} must be made afresh, got {made:?}");
+            };
+            assert_ne!(offset, u32::MAX);
+            assert!(
+                offset / 32 >= 49,
+                "table at slot {slot_idx} landed at {}, below dynamic_first 49",
+                offset / 32
+            );
+        }
+
+        // Slot 20 was read through a table: it must leave the bindless texture
+        // queue AND be mirrored in its pool slot.
+        assert!(
+            !host_heap.texture_slots_due(u64::MAX, 64).0.iter().any(|&(s, _)| s == 20),
+            "slot 20 read through a fresh table must leave the texture queue"
+        );
+        assert!(
+            host_heap.made(20),
+            "slot 20 read through a fresh table must be mirrored in its pool slot"
+        );
+
+        // Table starting at WINDOW - 1 (15) with a UsedResource at offset 0
+        // (< WINDOW) but an indexed view selecting slot +1 (16 == WINDOW) must
+        // ALSO be made afresh instead of indexing into pool slot 16.
+        state.set_table(true, 1, title.handle(15).unwrap());
+        state.set_constants(true, 0, &[1], 0);
+        let indexed = RootIndexedView {
+            table_slot: 1,
+            constant_slot: 0,
+            constant_dword: 0,
+            byte_offset: 0,
+            shift: 5, // constant * 32 bytes = +1 slot -> slot 16 (WINDOW)
+        };
+        let made = state.tables(&list, &[range], &[indexed], &[], true);
+        let [(1, offset)] = made[..] else {
+            panic!("table crossing WINDOW via indexed view must be made afresh, got {made:?}");
+        };
+        assert_ne!(offset, u32::MAX);
+        assert!(offset / 32 >= 49);
+
+        drop(state);
+        slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
+    }
+
     #[test]
     fn heaps_hold_count_descriptors_from_their_start() {
         let null = std::ptr::null();

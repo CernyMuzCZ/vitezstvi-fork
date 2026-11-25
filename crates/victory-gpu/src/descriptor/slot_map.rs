@@ -286,4 +286,113 @@ mod tests {
         assert_eq!(m.assign(10, 0), None);
         assert_eq!(m.entry(10), 0);
     }
+
+    /// Boundary title slots at exact WINDOW, MAP_SLOT - 1, and MAP_SLOT on the
+    /// 1,000,000-slot host layout: identity below WINDOW, mapped into pool slots
+    /// strictly below MAP_SLOT from WINDOW onward, and never colliding with
+    /// MAP_SLOT or reaching past the title heap.
+    #[test]
+    fn boundary_slots_at_window_map_slot_minus_one_and_map_slot() {
+        const WINDOW: u32 = 1 << 17; // 131_072
+        const MAP_SLOT: u32 = 1_000_000 - (1 << 18) - 2; // 737_854
+        const TITLE_COUNT: u32 = 1_245_184;
+        const POOL: u32 = MAP_SLOT - WINDOW; // 606_782
+
+        let mut m = SlotMap::new(WINDOW, TITLE_COUNT, WINDOW, POOL);
+        assert_eq!(m.window(), WINDOW);
+        assert_eq!(m.len(), TITLE_COUNT - WINDOW);
+
+        // Just below WINDOW: identity, no map entry.
+        assert_eq!(m.host(WINDOW - 1), Some(WINDOW - 1));
+        assert_eq!(m.assign(WINDOW - 1, 0), Some(WINDOW - 1));
+        assert_eq!(m.entry(WINDOW - 1), 0);
+
+        // Exactly WINDOW, MAP_SLOT - 1, MAP_SLOT, and TITLE_COUNT - 1:
+        // all take pool slots starting at WINDOW and strictly below MAP_SLOT.
+        let h_win = m.assign(WINDOW, 0).expect("WINDOW mapped");
+        let h_before = m.assign(MAP_SLOT - 1, 0).expect("MAP_SLOT - 1 mapped");
+        let h_map = m.assign(MAP_SLOT, 0).expect("MAP_SLOT mapped");
+        let h_last = m.assign(TITLE_COUNT - 1, 0).expect("TITLE_COUNT - 1 mapped");
+        assert_eq!([h_win, h_before, h_map, h_last], [WINDOW, WINDOW + 1, WINDOW + 2, WINDOW + 3]);
+        for (title, host) in [
+            (WINDOW, h_win),
+            (MAP_SLOT - 1, h_before),
+            (MAP_SLOT, h_map),
+            (TITLE_COUNT - 1, h_last),
+        ] {
+            assert!(host >= WINDOW && host < MAP_SLOT, "title {title} -> host {host}");
+            assert_eq!(m.host(title), Some(host));
+            assert_eq!(m.entry(title), !host);
+            assert_eq!(decode(m.entry(title)), Some(host));
+        }
+
+        // Past title_count: unmapped and refused.
+        assert_eq!(m.host(TITLE_COUNT), None);
+        assert_eq!(m.assign(TITLE_COUNT, 0), None);
+        assert_eq!(m.entry(TITLE_COUNT), 0);
+    }
+
+    /// Pool exhaustion refuses new title slots without ever assigning a host
+    /// slot at or past MAP_SLOT / 1,000,000; the shader's decode of entry 0
+    /// (`!0 == u32::MAX`) clamps to the guard slot (`999_999 < 1_000_000`).
+    #[test]
+    fn pool_exhaustion_clamps_to_guard_slot_below_one_million() {
+        const PORTABLE_VIEWS: u32 = 1_000_000;
+        const GUARD_SLOT: u32 = PORTABLE_VIEWS - 1;
+        const WINDOW: u32 = 1 << 17;
+        const MAP_SLOT: u32 = PORTABLE_VIEWS - (1 << 18) - 2;
+        const POOL: u32 = 64;
+
+        let mut m = SlotMap::new(WINDOW, WINDOW + POOL + 16, MAP_SLOT - POOL, POOL);
+        for i in 0..POOL {
+            let host = m.assign(WINDOW + i, 0).expect("pool slot available");
+            assert!(host < MAP_SLOT && host < PORTABLE_VIEWS);
+        }
+        // Pool exhausted: further title slots return None and map entry 0.
+        for extra in 0..16 {
+            let title = WINDOW + POOL + extra;
+            assert_eq!(m.assign(title, u64::MAX), None);
+            let raw_entry = m.entry(title);
+            assert_eq!(raw_entry, 0);
+            let shader_slot = (!raw_entry).min(GUARD_SLOT);
+            assert_eq!(shader_slot, GUARD_SLOT);
+            assert!(shader_slot < PORTABLE_VIEWS);
+        }
+        assert_eq!(m.refused, 16);
+    }
+
+    /// Reclaimed/freed pool slots wait in FIFO quarantine by submission number
+    /// and are never reused while any submission started at or before their
+    /// unmap may still run.
+    #[test]
+    fn reclaim_reuse_ordering_respects_in_flight_submissions() {
+        let mut m = SlotMap::new(16, 64, 16, 3);
+        let h0 = m.assign(16, 0).unwrap();
+        let h1 = m.assign(17, 0).unwrap();
+        let h2 = m.assign(18, 0).unwrap();
+        assert_eq!([h0, h1, h2], [16, 17, 18]);
+
+        // Unmap during in-flight submissions 10, 11, 12.
+        assert_eq!(m.free(16, 10), Some(16));
+        assert_eq!(m.free(17, 11), Some(17));
+        assert_eq!(m.free(18, 12), Some(18));
+
+        // While finished < 10, nothing may be reused.
+        assert_eq!(m.assign(20, 9), None);
+        assert_eq!(m.stats().quarantined, 3);
+
+        // Once submission 10 finishes, only h0 (16) is released; 17 and 18 stay quarantined.
+        assert_eq!(m.assign(20, 10), Some(16));
+        assert_eq!(m.assign(21, 10), None);
+        assert_eq!(m.stats().quarantined, 2);
+
+        // Once submission 12 finishes, both 17 and 18 become available.
+        let r1 = m.assign(21, 12).expect("released at 12");
+        let r2 = m.assign(22, 12).expect("released at 12");
+        let mut got = [r1, r2];
+        got.sort_unstable();
+        assert_eq!(got, [17, 18]);
+        assert_eq!(m.stats().quarantined, 0);
+        assert_eq!(m.stats().free, 0);
+    }
 }
