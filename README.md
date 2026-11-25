@@ -166,6 +166,7 @@ What did it, on top of the list below:
     flight); the copy-back thread's wait fell from about 125 to 7 ms a
     frame.
   - `VICTORY_INDIRECT_WINDOW=1`: see above.
+  - `VICTORY_INDIRECT_SINGLE=1`: one-thread clamp for single indirect records (off by default).
   - `VICTORY_TEXTURE_NO_WAIT=1`: a texture refresh no longer waits while
     the title remaps memory; the loading phase had 5 readings over a
     second where it had 18.
