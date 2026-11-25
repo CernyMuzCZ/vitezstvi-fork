@@ -1326,6 +1326,10 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
     #[cfg(windows)]
     crate::framelog::add(crate::framelog::T::PresentLineUs, presenting.elapsed().as_micros() as u64);
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+    // `VICTORY_FAST_BOOT`: its scripted presses stop once in the world.
+    if let Some(line) = victory_core::fastboot::frame_presented() {
+        tracing::warn!("{line}");
+    }
     #[cfg(windows)]
     if sent_behind && PRESENTS_BEHIND.load(Ordering::Relaxed).is_multiple_of(512) {
         tracing::info!(

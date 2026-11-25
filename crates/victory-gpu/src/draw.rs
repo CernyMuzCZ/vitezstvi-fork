@@ -784,6 +784,8 @@ impl State {
 
     /// Render targets and depth, set on the host list at once.
     pub(crate) fn set_targets(&mut self, list: &HostList, handles: &[u64], depth: u64) {
+        // `VICTORY_FAST_BOOT`: the world binds many targets a frame.
+        victory_core::fastboot::note_render_targets();
         let Some(host) = crate::host::host() else {
             return;
         };
