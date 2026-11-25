@@ -625,7 +625,11 @@ fn pump(context: Context, voice: &mut Voice) {
         return;
     }
     while context.field(1, 31, 1) == 1 {
-        if voice.pcm.len() < SAMPLES_PER_BLOCK && !decode(context, voice) {
+        // A skip or input switch can advance the decoder without producing
+        // samples. Leave the ring writable for the next decoder pass.
+        if voice.pcm.len() < SAMPLES_PER_BLOCK
+            && (!decode(context, voice) || voice.pcm.is_empty())
+        {
             return;
         }
         // The write block is the title's too: taken modulo the ring before
@@ -1293,6 +1297,15 @@ mod tests {
 
     #[test]
     fn xma_contexts_decode_into_their_output_rings() {
+        check_decoded_ring(0);
+    }
+
+    #[test]
+    fn skipping_a_whole_xma_frame_does_not_publish_a_silent_block() {
+        check_decoded_ring(4);
+    }
+
+    fn check_decoded_ring(skip_subframes: u32) {
         let _serial = lock(&CONTEXT_TESTS);
         let mut request = ShapeContexts {
             counts: [0, 0, 0, 0, 4, 0],
@@ -1318,7 +1331,7 @@ mod tests {
         // As the title sets one up: two packets, input 0 valid, a ring of
         // four blocks, writable, 48 kHz mono, reading from the first frame.
         context.set(0, 2 | 1 << 20 | 4 << 22);
-        context.set(1, 1 << 31 | 3 << 27);
+        context.set(1, 1 << 31 | 3 << 27 | skip_subframes << 24);
         context.set(2, 32);
         context.set(5, input_apu);
         context.set(7, output_apu);
@@ -1335,6 +1348,8 @@ mod tests {
             );
         };
         submit(ENABLE_XMA, &[1]);
+        xma().pump();
+        // A fully skipped first frame leaves the ring for the next pass.
         xma().pump();
         // Full: all four blocks written (silence), the write block wrapped
         // onto the read block, and the ring no longer writable.
@@ -1355,7 +1370,8 @@ mod tests {
         }
         // Six frames and the flushed tail: 3,328 samples, 26 blocks.
         let produced = |x: &Xma| lock(&x.voices[1]).as_ref().map(|v| v.trace.produced);
-        assert_eq!(produced(&xma()), Some(26 * SAMPLES_PER_BLOCK));
+        let skipped = skip_subframes as usize * xma::SUBFRAME_SAMPLES;
+        assert_eq!(produced(&xma()), Some(26 * SAMPLES_PER_BLOCK - skipped));
         assert_eq!(context.field(0, 20, 2), 0, "input used up");
         assert_eq!(context.field(2, 26, 5), INPUT_INVALID);
 
