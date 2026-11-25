@@ -1567,21 +1567,52 @@ extern "system" fn copy_page_mappings(
         });
         crate::host::land_before_remap(b.destination, len);
     }
-    let mut ok = true;
-    let batch = crate::resource::batch_page_mappings();
-    for b in batches.into_iter().flatten() {
-        if b.ranges.is_null() {
-            continue;
-        }
-        // SAFETY: each batch holds `count` ranges.
-        let ranges = unsafe { std::slice::from_raw_parts(b.ranges, b.count as usize) };
-        ok &= copy_page_ranges(ranges, b.destination, pool, pool_pages, batch, map);
-    }
+    let ok = batches.is_none_or(|batches| map_batches(remap_batch(), batches, pool, pool_pages, map));
     if !ok {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| tracing::warn!(pool = format_args!("{pool:#x}"), "a page mapping failed"));
     }
     S_OK
+}
+
+/// Whether one `CopyPageMappingsBatchX` holds title memory still once for
+/// every page in its batches (`VICTORY_REMAP_BATCH=1`; off by default).
+#[cfg(windows)]
+fn remap_batch() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_REMAP_BATCH").is_some_and(|v| v == "1"))
+}
+
+#[cfg(not(windows))]
+fn remap_batch() -> bool {
+    false
+}
+
+/// Maps `batches` with `map` (`(to, from, len)`, `from` 0 unmaps), as
+/// [`copy_page_mappings`] does; with `hold`, title memory is held still once
+/// around all of them ([`remap_batch`]). False if a mapping failed.
+fn map_batches(
+    hold: bool,
+    batches: &[PageBatch],
+    pool: u64,
+    pool_pages: u32,
+    map: impl Fn(u64, u64, u64) -> bool,
+) -> bool {
+    #[cfg(windows)]
+    let _held = hold.then(crate::watch::title_memory_remapping);
+    #[cfg(not(windows))]
+    let _ = hold;
+    let mut ok = true;
+    let batch = crate::resource::batch_page_mappings();
+    for b in batches {
+        if b.ranges.is_null() {
+            continue;
+        }
+        // SAFETY: each batch holds `count` ranges.
+        let ranges = unsafe { std::slice::from_raw_parts(b.ranges, b.count as usize) };
+        ok &= copy_page_ranges(ranges, b.destination, pool, pool_pages, batch, &map);
+    }
+    ok
 }
 
 extern "system" fn desc(this: This, out: *mut QueueDesc) {
@@ -1765,5 +1796,55 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         Written::GpuTimestamp.write(at[1..].as_mut_ptr().cast(), 8);
         assert!(at[1] > first);
+    }
+}
+
+#[cfg(all(test, windows))]
+mod batch_tests {
+    use super::{PAGE, PageBatch, PageRange, map_batches};
+    use std::sync::Mutex;
+
+    /// The pool pages a batch of each kind of range maps, in order, and
+    /// that no read of title memory in place can begin in the middle of
+    /// the batch (held once with `hold`, or by each page's own taking).
+    #[test]
+    fn a_batch_maps_the_same_pages_held_once_or_page_by_page() {
+        let ranges = [
+            PageRange { kind: 0, start: 2, count: 3 },
+            PageRange { kind: 1, start: 7, count: 2 },
+            PageRange { kind: 2, start: 0, count: 1 },
+            PageRange { kind: 3, start: 0, count: 4 },
+            PageRange { kind: 0, start: 9, count: 1 },
+        ];
+        let (dest, pool) = (0x10_0000_0000u64, 0x20_0000_0000u64);
+        let batches = [PageBatch {
+            destination: dest,
+            count: ranges.len() as u32,
+            ranges: ranges.as_ptr(),
+        }];
+        let expected = vec![
+            (dest, pool + 2 * PAGE, 3 * PAGE),
+            (dest + 3 * PAGE, pool + 7 * PAGE, PAGE),
+            (dest + 4 * PAGE, pool + 7 * PAGE, PAGE),
+            (dest + 5 * PAGE, 0, PAGE),
+            (dest + 10 * PAGE, pool + 9 * PAGE, PAGE),
+        ];
+        for hold in [false, true, false] {
+            let seen = Mutex::new(Vec::new());
+            let map = |to, from, len| {
+                let _changing = crate::watch::title_memory_remapping();
+                assert!(
+                    crate::watch::title_memory_reading_now().is_none(),
+                    "a read began during a remap"
+                );
+                seen.lock().unwrap().push((to, from, len));
+                true
+            };
+            assert!(map_batches(hold, &batches, pool, 16, map));
+            assert_eq!(*seen.lock().unwrap(), expected, "hold {hold}");
+        }
+        let bad = [PageRange { kind: 0, start: 15, count: 2 }];
+        let batches = [PageBatch { destination: dest, count: 1, ranges: bad.as_ptr() }];
+        assert!(!map_batches(true, &batches, pool, 16, |_, _, _| true));
     }
 }
