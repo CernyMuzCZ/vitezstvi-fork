@@ -3035,17 +3035,38 @@ impl State {
                     }
                     _ => (stride, max),
                 };
-                args.refresh(list, arguments, len.max(u64::from(step) * u64::from(records)));
+                let span = len.max(u64::from(step) * u64::from(records));
+                args.refresh(list, arguments, span);
                 if let Some((s, at)) = &counter {
                     s.refresh(list, *at, 4);
                 }
+                // Whether a shader recorded before in the list may write the
+                // records: if none may, the card holds them as they are when
+                // the list begins, and they are clamped in its prelude
+                // (`crate::indirect::early`): nothing of ours goes into the
+                // list.
+                let written = list.writes_declared((arguments as usize, (arguments + span) as usize));
+                let early = crate::indirect::early() && counter.is_none() && !written;
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(
+                    match (kind == DISPATCH, written) {
+                        (false, false) => crate::copystat::C::ClampFromBefore,
+                        (false, true) => crate::copystat::C::ClampWrittenInList,
+                        (true, false) => crate::copystat::C::ClampDispatchFromBefore,
+                        (true, true) => crate::copystat::C::ClampDispatchWrittenInList,
+                    },
+                    1,
+                );
                 // Bounded first: the clamp binds a compute pipeline of its
                 // own and copies clamped active records into room of the
                 // list's ring, or its scratch buffer at offset 0.
                 let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
                 // More than the record asked for: a window clamped ahead,
                 // whose unfilled slots must not spend the list's budget.
-                let bounded = if windowed && records > 1 {
+                let ahead = windowed && records > 1;
+                let bounded = if early {
+                    crate::indirect::bound_early(list, (&args.buffer, offset), (kind, step, records), ahead)
+                } else if ahead {
                     crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records))
                 } else {
                     crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records))
@@ -3055,8 +3076,12 @@ impl State {
                     why("not bounded (no clamp, or arguments not 4-byte aligned)");
                     return false;
                 };
-                self.host_pipeline = 0;
-                self.host_roots[1] = 0;
+                // A clamp in the list bound its own pipeline and compute
+                // root signature.
+                if !early {
+                    self.host_pipeline = 0;
+                    self.host_roots[1] = 0;
+                }
                 self.window = windowed.then(|| Window {
                     copy: args.id(),
                     kind,
