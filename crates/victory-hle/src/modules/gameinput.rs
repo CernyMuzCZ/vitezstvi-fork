@@ -1488,8 +1488,10 @@ mod host {
     use std::sync::atomic::Ordering;
 
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows_sys::Win32::System::Threading::GetCurrentProcessId;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-        GetAsyncKeyState, MAPVK_VK_TO_VSC_EX, MapVirtualKeyW,
+        GetAsyncKeyState, GetKeyboardLayout, HKL, MAPVK_VK_TO_CHAR, MAPVK_VK_TO_VSC_EX,
+        MapVirtualKeyExW,
     };
     use windows_sys::Win32::UI::Input::{
         GetRawInputData, HRAWINPUT, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER, RID_INPUT,
@@ -1505,7 +1507,7 @@ mod host {
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         ClipCursor, CreateWindowExW, DefWindowProcW, DispatchMessageW,
-        GetForegroundWindow, GetMessageW, GetWindowTextW, HWND_MESSAGE,
+        GetForegroundWindow, GetMessageW, GetWindowTextW, GetWindowThreadProcessId, HWND_MESSAGE,
         MSG, RegisterClassW, SMTO_ABORTIFHUNG, SendMessageTimeoutW, WM_INPUT, WM_SETTEXT,
         WNDCLASSW,
     };
@@ -1867,16 +1869,7 @@ mod host {
                     .collect();
                 down.extend(held);
             }
-            down.into_iter()
-                .map(|vk| KeyState {
-                    // SAFETY: plain query.
-                    scan_code: unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC_EX) },
-                    virtual_key: vk,
-                    // shortcut: no characters (code point 0);
-                    // the title reads scan codes and virtual keys only.
-                    ..Default::default()
-                })
-                .collect()
+            readings(down, focus.then(focused_layout).flatten())
         }
 
         fn mouse_buttons(&mut self) -> Vec<u8> {
@@ -2087,6 +2080,67 @@ mod host {
                 Duration::try_from_secs_f64(hold).ok()?,
                 what,
             ))
+        }
+    }
+
+    fn key_state(vk: u8, layout: HKL) -> KeyState {
+        // The unshifted keycap glyph is independent of modifier state. This
+        // query also identifies dead keys without consuming a pending accent.
+        // SAFETY: both queries use the layout returned by Windows.
+        let (scan_code, glyph) = unsafe {
+            (
+                MapVirtualKeyExW(u32::from(vk), MAPVK_VK_TO_VSC_EX, layout),
+                MapVirtualKeyExW(u32::from(vk), MAPVK_VK_TO_CHAR, layout),
+            )
+        };
+        KeyState {
+            scan_code,
+            virtual_key: vk,
+            code_point: glyph & 0xffff,
+            dead_key: glyph & 0x8000_0000 != 0,
+        }
+    }
+
+    fn readings(down: Vec<u8>, layout: Option<HKL>) -> Vec<KeyState> {
+        if down.is_empty() {
+            return Vec::new();
+        }
+        // Scripted keys can be held even when no title window has focus.
+        // SAFETY: zero selects the calling thread's layout.
+        let layout = layout.unwrap_or_else(|| unsafe { GetKeyboardLayout(0) });
+        down.into_iter().map(|vk| key_state(vk, layout)).collect()
+    }
+
+    fn focused_layout() -> Option<HKL> {
+        let mut process = 0;
+        // SAFETY: plain queries; a null window gives process 0.
+        unsafe {
+            let thread = GetWindowThreadProcessId(GetForegroundWindow(), &mut process);
+            (process == GetCurrentProcessId()).then(|| GetKeyboardLayout(thread))
+        }
+    }
+
+    #[test]
+    fn keyboard_readings_include_keycap_and_extended_scan_code() {
+        // SAFETY: zero selects the calling thread's installed layout.
+        let layout = unsafe { GetKeyboardLayout(0) };
+        let letter = key_state(b'A', layout);
+        assert_eq!(letter.code_point, u32::from(b'A'));
+        assert!(!letter.dead_key);
+        let right_ctrl = key_state(0xa3, layout);
+        assert_eq!((right_ctrl.scan_code, right_ctrl.code_point), (0xe01d, 0));
+
+        // Classic French AZERTY has a dead circumflex and an unshifted é.
+        // Use it when installed without switching the user's keyboard.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetKeyboardLayoutNameW;
+        let mut name = [0u16; 9];
+        // SAFETY: the buffer holds KL_NAMELENGTH UTF-16 units.
+        if unsafe { GetKeyboardLayoutNameW(name.as_mut_ptr()) } != 0
+            && String::from_utf16_lossy(&name[..8]) == "0000040C"
+        {
+            let accent = key_state(0xdd, layout);
+            assert_eq!((accent.code_point, accent.dead_key), ('^' as u32, true));
+            assert_eq!(key_state(b'2', layout).code_point, 'é' as u32);
         }
     }
 
