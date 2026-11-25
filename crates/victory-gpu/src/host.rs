@@ -742,7 +742,7 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
         } else {
-            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            crate::dlss::create_d3d12_device(D3D_FEATURE_LEVEL_12_0, &mut device)?;
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
         // `VICTORY_D3D12_BACKGROUND=0`: the runtime's background work (the
@@ -811,7 +811,7 @@ fn create() -> windows::core::Result<Host> {
                 ..Default::default()
             })?;
         let dsv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
-        let adapter = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+        let adapter = crate::dlss::create_dxgi_factory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
             .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
             .ok();
         tracing::info!("host D3D12 device ready");
@@ -9465,6 +9465,7 @@ impl Host {
         if (p.width, p.height, p.format) != (width, height, format) {
             // Presents sent ahead hold back buffers until they have run.
             settle_now(WHY_SYNC);
+            crate::dlss::on_before_resize();
             // SAFETY: no back buffer is held; every submission was waited for.
             let resized = unsafe {
                 p.swap_chain
@@ -9502,7 +9503,7 @@ impl Host {
             let read_now = crate::capture::wanted(frame) || crate::capture::listed(frame);
             #[cfg(not(feature = "diagnostics"))]
             let read_now = false;
-            let slot = if late_free_present() && !read_now {
+            let slot = if late_free_present() && !read_now && !crate::dlss::fg_active_swapchain() {
                 let finished = FINISHED.load(Ordering::Acquire);
                 p.ahead.iter().position(|(_, flown)| *flown <= finished).or_else(|| {
                     let list = self.new_list().ok()?;
@@ -9618,6 +9619,7 @@ impl Host {
                 ]);
             }
             copy.close();
+            crate::dlss::on_render_submit_start();
             match slot {
                 Some(i) => {
                     let flown = self.execute_own(copy);
@@ -9625,6 +9627,7 @@ impl Host {
                 }
                 None => self.execute(&[copy]),
             }
+            crate::dlss::on_render_submit_end();
             #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
@@ -9641,7 +9644,9 @@ impl Host {
                     *last = Some(current);
                 }
             }
+            crate::dlss::before_present(width, height, format);
             let presented = p.swap_chain.Present(sync_interval, flags);
+            crate::dlss::after_present(presented.is_ok());
             if presented.is_ok()
                 && let Some(times) = &mut p.times
                 && let Err(error) = times.frame()
@@ -9673,7 +9678,8 @@ impl Host {
         self.log_video_memory("right before the swap chain is made");
         // SAFETY: plain object creation for our window.
         unsafe {
-            let factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+            let factory: IDXGIFactory2 =
+                crate::dlss::create_dxgi_factory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
             let desc = DXGI_SWAP_CHAIN_DESC1 {
                 Width: width,
                 Height: height,
@@ -9690,6 +9696,7 @@ impl Host {
             let swap_chain = factory
                 .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
                 .cast::<IDXGISwapChain3>()?;
+            crate::dlss::on_swapchain_created(width, height, format, BUFFERS);
             let log_present = std::env::var_os("VICTORY_LOG_PRESENT").is_some_and(|v| v == "1");
             if log_present {
                 match swap_chain.GetDesc1() {
