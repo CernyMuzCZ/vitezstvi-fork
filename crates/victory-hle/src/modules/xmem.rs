@@ -10,7 +10,7 @@
 use std::alloc::{Layout, alloc, dealloc};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock};
 
 use windows_sys::Win32::Foundation::{
@@ -401,6 +401,11 @@ struct Section {
     /// share it only when their bytes do not touch; a claim that does is
     /// refused and the caller takes a temporary view instead.
     holding: Mutex<Vec<(usize, usize)>>,
+    /// With [`lean_remaps`]: one bit a page, set once a view of ours has
+    /// committed it. A section page committed through any view stays
+    /// committed for all of them, and these bits live and die with the
+    /// section, so a page number used again in a new section starts clear.
+    committed: Box<[AtomicU64]>,
 }
 
 // SAFETY: a section handle may be used from any thread.
@@ -418,6 +423,7 @@ impl Section {
             generation: (0..pages).map(|_| AtomicU32::new(0)).collect(),
             fallback_noted: OnceLock::new(),
             holding: Mutex::new(Vec::new()),
+            committed: (0..pages.div_ceil(64)).map(|_| AtomicU64::new(0)).collect(),
         }
     }
 
@@ -767,6 +773,43 @@ struct Slice {
     section: Arc<Section>,
     index: usize,
 }
+
+impl Slice {
+    /// Whether this page and the `n - 1` after it were committed through a
+    /// view of ours ([`lean_remaps`]).
+    fn committed(&self, n: usize) -> bool {
+        (self.index..self.index + n).all(|i| {
+            self.section
+                .committed
+                .get(i / 64)
+                .is_some_and(|w| w.load(Ordering::Relaxed) & 1 << (i % 64) != 0)
+        })
+    }
+
+    /// Notes this page and the `n - 1` after it committed.
+    fn note_committed(&self, n: usize) {
+        for i in self.index..self.index + n {
+            if let Some(w) = self.section.committed.get(i / 64) {
+                w.fetch_or(1 << (i % 64), Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// Whether a page mapping skips the kernel calls that change nothing
+/// (`VICTORY_REMAP_LEAN=1`; off by default). Each page the title remaps
+/// (`map_alias`) took four calls that each hold the process's address space:
+/// unmap, placeholder split, map view, commit. With the switch the view is
+/// mapped first and the placeholder split only if that fails, and pages
+/// committed once are not committed again: two calls a remap.
+fn lean_remaps() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_REMAP_LEAN").is_some_and(|v| v == "1"))
+}
+
+/// Since the start, with [`lean_remaps`]: placeholder splits and commits
+/// skipped; logged now and then.
+static LEAN: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 impl Slice {
     /// The key in `Physical::shown` of the page `k` pages after this one.
@@ -1449,37 +1492,66 @@ fn alias_slice(physical: &Physical, at: usize) -> Option<Slice> {
 /// must lie in one placeholder.
 fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     const MEM_COALESCE_PLACEHOLDERS: u32 = 1;
+    let lean = lean_remaps();
     // SAFETY: the reservation belongs to the title and these calls only
     // split, merge or replace placeholders in that reservation.
-    let view = unsafe {
+    let replace = || unsafe {
+        MapViewOfFile3(
+            slice.section.handle,
+            GetCurrentProcess(),
+            base as *const c_void,
+            (slice.index * PAGE) as u64,
+            len,
+            MEM_REPLACE_PLACEHOLDER,
+            PAGE_READWRITE,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    let split = || unsafe {
         VirtualFree(
             base as *mut c_void,
             len,
             MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
         );
-        let replace = || {
-            MapViewOfFile3(
-                slice.section.handle,
-                GetCurrentProcess(),
-                base as *const c_void,
-                (slice.index * PAGE) as u64,
-                len,
-                MEM_REPLACE_PLACEHOLDER,
-                PAGE_READWRITE,
-                std::ptr::null_mut(),
-                0,
-            )
-        };
+    };
+    let view = if lean {
+        let view = replace();
+        if view.Value as usize == base {
+            LEAN[0].fetch_add(1, Ordering::Relaxed);
+            view
+        } else {
+            split();
+            let view = replace();
+            if view.Value.is_null()
+                && len > PAGE
+                && unsafe {
+                    VirtualFree(
+                        base as *mut c_void,
+                        len,
+                        MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS,
+                    ) != 0
+                }
+            {
+                replace()
+            } else {
+                view
+            }
+        }
+    } else {
+        split();
         let view = replace();
         // Unmapping separate page views leaves separate placeholders.
         // One section view needs a single placeholder of the same size.
         if view.Value.is_null()
             && len > PAGE
-            && VirtualFree(
-                base as *mut c_void,
-                len,
-                MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS,
-            ) != 0
+            && unsafe {
+                VirtualFree(
+                    base as *mut c_void,
+                    len,
+                    MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS,
+                ) != 0
+            }
         {
             replace()
         } else {
@@ -1495,10 +1567,25 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         );
         return false;
     }
-    if !commit(base, len) {
-        // SAFETY: the view just mapped, back to a placeholder.
-        unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
-        return false;
+    let pages = len.div_ceil(PAGE);
+    if lean && slice.committed(pages) {
+        let skipped = LEAN[1].fetch_add(1, Ordering::Relaxed) + 1;
+        if skipped.is_multiple_of(1 << 16) {
+            tracing::info!(
+                splits_skipped = LEAN[0].load(Ordering::Relaxed),
+                commits_skipped = skipped,
+                "page mappings without the kernel calls that change nothing (VICTORY_REMAP_LEAN=1), since the start"
+            );
+        }
+    } else {
+        if !commit(base, len) {
+            // SAFETY: the view just mapped, back to a placeholder.
+            unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
+            return false;
+        }
+        if lean {
+            slice.note_committed(pages);
+        }
     }
     // New contents, read-write: the GPU side's copies no longer guard it.
     victory_gpu::title_memory_remapped(base, len);
