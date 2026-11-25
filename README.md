@@ -440,23 +440,31 @@ The window caption shows the framerate. Saves, settings and `crashes.log`
 are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
 data under the cache folder.
 
-Input: XInput pads. With none connected the keyboard is a pad while the
-title's window has focus:
+Input: XInput pads, and the keyboard and mouse as one more pad (all sources
+feed one virtual pad). Click the window to capture the mouse (Alt frees it):
 
-| Keys | Pad |
+| Keys / mouse | Pad |
 |------|-----|
-| W A S D / I J K L | left / right stick |
-| arrows | D-pad |
-| Enter, Backspace, X, Y | A, B, X, Y |
-| Q / E, Z / C | shoulders, triggers |
-| F / H | stick clicks |
-| Esc, Tab | Menu, View |
+| W A S D, mouse motion | left stick, right stick |
+| left / right mouse button | RT / LT |
+| Shift, Space, E or F | A, X, Y |
+| Q / R | LB / RB |
+| Ctrl / C or middle button | stick clicks |
+| Enter, Esc or Backspace | A, B |
+| arrows, wheel | D-pad |
+| Tab / P | View / Menu |
+| G | on-foot / vehicle layout |
+
+`VICTORY_KBM=0` brings back the old stand-in keys (W A S D / I J K L sticks,
+Enter, Backspace, X, Y). Sensitivity, inversion and key maps: `docs/input.md`.
 
 Upscaler: the title uses AMD's FidelityFX upscaler (FSR) on Series S. Point
 `VICTORY_FFX_DIR` at `Kits\FidelityFX\signedbin` of AMD's public
 [FidelityFX SDK](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK)
 (2.x) to answer its calls with the PC upscaler for D3D12 instead of the
-console's, which only has 1080p tables.
+console's, which only has 1080p tables. The known build's title patches
+(`VICTORY_TITLE_PATCHES=0`: none) keep the title's own upscaler on every
+console; to try FidelityFX, turn them off and force both picker sites to 7.
 
 ## Commands
 
