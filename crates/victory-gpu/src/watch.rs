@@ -584,6 +584,10 @@ struct Guards {
 struct CleanBlocks(BTreeMap<usize, usize>);
 
 impl CleanBlocks {
+    fn contains(&self, block: &usize) -> bool {
+        self.0.range(..=*block).next_back().is_some_and(|(_, &end)| *block < end)
+    }
+
     fn insert(&mut self, mut from: usize, mut to: usize) {
         if from >= to {
             return;

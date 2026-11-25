@@ -239,6 +239,7 @@ impl Shader {
                     limited_twin: OnceLock::new(),
                     group: OnceLock::new(),
                     walks: OnceLock::new(),
+                    resolves_light: self.resolves_light,
                 })
             })
             .clone()
